@@ -7,6 +7,7 @@
 #include "mtmd.h"
 
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -63,8 +64,8 @@ jf_ctx *jf_load(
     cp.type_k = GGML_TYPE_Q8_0;
     cp.type_v = GGML_TYPE_Q8_0;
     if (n_seq_max > 1) {
-        /* Prompts in one batch do not share a suffix. A unified mask is the wrong shape. */
-        cp.kv_unified = false;
+        /* A pack of questions shares its head. Keep one attention buffer for that head. */
+        cp.kv_unified = true;
     }
     ctx = llama_init_from_model(model, cp);
     if (!ctx) {
@@ -83,6 +84,12 @@ jf_ctx *jf_load(
     h->vocab = llama_model_get_vocab(model);
     h->n_vocab = llama_vocab_n_tokens(h->vocab);
     h->n_seq_max = n_seq_max;
+    fprintf(
+        stderr,
+        "[bonjev] ctx=%u ctx_seq=%u seq_max=%u\n",
+        llama_n_ctx(ctx),
+        llama_n_ctx_seq(ctx),
+        llama_n_seq_max(ctx));
     return h;
 }
 
@@ -172,12 +179,73 @@ int32_t jf_decode(jf_ctx *h, const int32_t *tokens, int32_t n) {
     return 0;
 }
 
+static int32_t common_prefix(const int32_t *const *toks, const int32_t *lens, int32_t n_seq) {
+    int32_t n = lens[0];
+    int32_t i;
+    int32_t s;
+
+    for (s = 1; s < n_seq; s++) {
+        if (lens[s] < n) {
+            n = lens[s];
+        }
+    }
+    for (i = 0; i < n; i++) {
+        int32_t tok = toks[0][i];
+        for (s = 1; s < n_seq; s++) {
+            if (toks[s][i] != tok) {
+                return i;
+            }
+        }
+    }
+    return n;
+}
+
+/* One token, many sequence ids: the shared prompt head is stored once. */
+static int32_t decode_shared_prefix(jf_ctx *h, const int32_t *tokens, int32_t n, int32_t n_seq) {
+    int32_t off = 0;
+
+    while (off < n) {
+        struct llama_batch batch;
+        int32_t m = n - off;
+        int32_t i;
+        int32_t s;
+        int32_t rc;
+
+        if (m > JF_BATCH) {
+            m = JF_BATCH;
+        }
+        batch = llama_batch_init(m, 0, n_seq);
+        if (!batch.token || !batch.pos || !batch.n_seq_id || !batch.seq_id || !batch.logits) {
+            llama_batch_free(batch);
+            return -1;
+        }
+        for (i = 0; i < m; i++) {
+            batch.token[i] = tokens[off + i];
+            batch.pos[i] = off + i;
+            batch.n_seq_id[i] = n_seq;
+            for (s = 0; s < n_seq; s++) {
+                batch.seq_id[i][s] = s;
+            }
+            batch.logits[i] = (off + i == n - 1) ? 1 : 0;
+        }
+        batch.n_tokens = m;
+        rc = llama_decode(h->ctx, batch);
+        llama_batch_free(batch);
+        if (rc != 0) {
+            return rc;
+        }
+        off += m;
+    }
+    return 0;
+}
+
 int32_t jf_decode_many(
     jf_ctx *h, const int32_t *const *toks, const int32_t *lens, int32_t n_seq, float *out_logits) {
     llama_memory_t mem;
     int32_t max_n;
     int32_t width;
     int32_t off;
+    int32_t prefix;
     int32_t s;
 
     if (!h || !h->ctx || !toks || !lens || !out_logits || n_seq < 1 || n_seq > h->n_seq_max) {
@@ -202,7 +270,38 @@ int32_t jf_decode_many(
     }
     llama_memory_clear(mem, true);
 
-    off = 0;
+    prefix = n_seq > 1 ? common_prefix(toks, lens, n_seq) : 0;
+    if (prefix > 0) {
+        int32_t rc = decode_shared_prefix(h, toks[0], prefix, n_seq);
+        if (rc != 0) {
+            fprintf(stderr, "[bonjev] pack share failed rc=%d at %d, full prefill\n", rc, prefix);
+            llama_memory_clear(mem, true);
+            prefix = 0;
+        } else {
+            int32_t ended = 0;
+            const float *row;
+            for (s = 0; s < n_seq; s++) {
+                if (lens[s] == prefix) {
+                    ended = 1;
+                    break;
+                }
+            }
+            row = ended ? llama_get_logits(h->ctx) : NULL;
+            if (ended && !row) {
+                return -1;
+            }
+            for (s = 0; s < n_seq; s++) {
+                if (lens[s] == prefix) {
+                    memcpy(
+                        out_logits + (size_t) s * (size_t) h->n_vocab,
+                        row,
+                        (size_t) h->n_vocab * sizeof(float));
+                }
+            }
+        }
+    }
+
+    off = prefix;
     while (off < max_n) {
         struct llama_batch batch;
         int32_t count = 0;

@@ -10,23 +10,17 @@ pub fn sandwich_chars_threshold() -> usize {
 }
 
 pub fn sandwich_disabled() -> bool {
-    std::env::var("BONJEV_SANDWICH").as_deref() == Ok("0")
-        || sandwich_chars_threshold() == 0
+    std::env::var("BONJEV_SANDWICH").as_deref() == Ok("0") || sandwich_chars_threshold() == 0
 }
 
 /// Flattened judge/request-evidence pairs (request:/response: blocks), not long prose policies.
 pub fn state_is_structured_evidence(state: &str) -> bool {
     let s = state.trim();
-    s.starts_with("request:")
-        || (s.contains("request:") && s.contains("response:"))
+    s.starts_with("request:") || (s.contains("request:") && s.contains("response:"))
 }
 
-pub fn state_char_len(state: &str) -> usize {
-    state.trim().len()
-}
-
-pub fn use_sandwich_layout(state: &str) -> bool {
-    !sandwich_disabled() && state_char_len(state) >= sandwich_chars_threshold()
+pub fn use_sandwich_layout(state: &crate::prompt::StateValue) -> bool {
+    !sandwich_disabled() && state.char_len() >= sandwich_chars_threshold()
 }
 
 /// Static think prefill on long prose only (net +1 vs always-on think on this bench).
@@ -37,9 +31,9 @@ pub fn think_chars_threshold() -> usize {
         .unwrap_or(8000)
 }
 
-pub fn use_think_prefill(state: &str) -> bool {
-    if state_is_structured_evidence(state) {
+pub fn use_think_prefill(state: &crate::prompt::StateValue) -> bool {
+    if state.is_structured_evidence() {
         return false;
     }
-    state_char_len(state) >= think_chars_threshold()
+    state.char_len() >= think_chars_threshold()
 }

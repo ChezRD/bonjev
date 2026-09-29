@@ -1,11 +1,12 @@
-use crate::decision::{self, Request, Response};
+use crate::decision::{self, Request, Response, RunError};
 use crate::engine::Engine;
-use anyhow::Result;
+use axum::extract::rejection::JsonRejection;
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response as HttpResponse};
 use axum::{
+    Json, Router,
     extract::State,
     routing::{get, post},
-    Json, Router,
 };
 use serde::Serialize;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
@@ -24,7 +25,7 @@ enum Slot {
 
 struct Job {
     req: Request,
-    reply: Sender<Result<Response>>,
+    reply: Sender<Result<Response, RunError>>,
 }
 
 pub fn direct(engine: Engine, model_name: String) -> AppState {
@@ -78,8 +79,14 @@ async fn models(State(st): State<Arc<AppState>>) -> Json<ModelList> {
 
 async fn systemone(
     State(st): State<Arc<AppState>>,
-    Json(req): Json<Request>,
-) -> Result<Json<Response>, (StatusCode, String)> {
+    payload: Result<Json<Request>, JsonRejection>,
+) -> HttpResponse {
+    let Json(req) = match payload {
+        Ok(json) => json,
+        Err(err) => {
+            return error_json(StatusCode::UNPROCESSABLE_ENTITY, err.to_string(), None);
+        }
+    };
     let result = if matches!(st.slot, Slot::Batch(_)) {
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         {
@@ -89,32 +96,77 @@ async fn systemone(
             if tx
                 .lock()
                 .unwrap_or_else(|err| err.into_inner())
-                .send(Job { req, reply: reply_tx })
+                .send(Job {
+                    req,
+                    reply: reply_tx,
+                })
                 .is_err()
             {
-                return Err((StatusCode::INTERNAL_SERVER_ERROR, "batch worker stopped".to_string()));
+                return error_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "batch worker stopped".to_string(),
+                    None,
+                );
             }
         }
         match tokio::task::spawn_blocking(move || reply_rx.recv()).await {
             Ok(Ok(body)) => body,
             Ok(Err(_)) => {
-                return Err((
+                return error_json(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "batch worker dropped the reply".to_string(),
-                ))
+                    None,
+                );
             }
-            Err(err) => return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
+            Err(err) => {
+                return error_json(StatusCode::INTERNAL_SERVER_ERROR, err.to_string(), None);
+            }
         }
     } else {
         match tokio::task::spawn_blocking(move || decide(&st, req)).await {
             Ok(body) => body,
-            Err(err) => return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
+            Err(err) => {
+                return error_json(StatusCode::INTERNAL_SERVER_ERROR, err.to_string(), None);
+            }
         }
     };
     match result {
-        Ok(body) => Ok(Json(body)),
-        Err(err) => Err((StatusCode::BAD_REQUEST, err.to_string())),
+        Ok(body) => Json(body).into_response(),
+        Err(err) => decide_error(err),
     }
+}
+
+fn decide_error(err: RunError) -> HttpResponse {
+    match err {
+        RunError::Wire(err) => error_json(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            err.to_string(),
+            Some(err.field().to_string()),
+        ),
+        RunError::Engine(err) => {
+            error_json(StatusCode::INTERNAL_SERVER_ERROR, err.to_string(), None)
+        }
+    }
+}
+
+fn error_json(status: StatusCode, message: String, field: Option<String>) -> HttpResponse {
+    #[derive(Serialize)]
+    struct Body {
+        error: Detail,
+    }
+    #[derive(Serialize)]
+    struct Detail {
+        message: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        field: Option<String>,
+    }
+    (
+        status,
+        Json(Body {
+            error: Detail { message, field },
+        }),
+    )
+        .into_response()
 }
 
 fn batch_loop(mut engine: Engine, model_name: String, rx: Receiver<Job>, parallel: usize) {
@@ -155,9 +207,9 @@ fn gather(rx: &Receiver<Job>, parallel: usize) -> Option<Vec<Job>> {
     Some(jobs)
 }
 
-fn decide(st: &AppState, req: Request) -> Result<Response> {
+fn decide(st: &AppState, req: Request) -> Result<Response, RunError> {
     let Slot::Direct(engine) = &st.slot else {
-        anyhow::bail!("direct decide on a batch server");
+        return Err(anyhow::anyhow!("direct decide on a batch server").into());
     };
     let mut engine = engine_lock(engine);
     decision::run(&mut engine, &st.model_name, req)

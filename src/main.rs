@@ -7,8 +7,9 @@ mod picture;
 mod prompt;
 mod readout;
 mod server;
+mod yaml_emit;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand};
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
@@ -64,7 +65,8 @@ struct ServeArgs {
     common: ModelArgs,
     #[arg(long, default_value_t = 8080)]
     port: u16,
-    /// How many prompts to score at once. 1 is one sequence.
+    /// How many HTTP requests to take from the queue at once.
+    /// One request still scores up to 6 questions together.
     #[arg(long, default_value_t = 1)]
     parallel: u32,
 }
@@ -153,7 +155,10 @@ fn attach_vision(engine: &mut engine::Engine, args: &ModelArgs, model_name: &str
     };
     eprintln!("[bonjev] vision: {}", path.display());
     engine.load_vision(&path, args.threads)?;
-    eprintln!("[bonjev] vision marker: {}", engine.media_marker().unwrap_or(""));
+    eprintln!(
+        "[bonjev] vision marker: {}",
+        engine.media_marker().unwrap_or("")
+    );
     Ok(())
 }
 
@@ -162,10 +167,8 @@ fn load_engine(args: &ModelArgs) -> Result<(engine::Engine, String)> {
     eprintln!("[bonjev] model: {}", path.display());
     let mut engine = engine::Engine::load(&path, args.ctx, args.threads, args.ngl)?;
     attach_vision(&mut engine, args, name)?;
-    eprintln!(
-        "[bonjev] loaded: vocab={} ctx={}",
-        engine.n_vocab, args.ctx
-    );
+    eprintln!("[bonjev] loaded: vocab={} ctx={}", engine.n_vocab, args.ctx);
+    decision::load_choice_prior(&mut engine, args.ctx as usize)?;
     Ok((engine, format!("bonjev-{name}")))
 }
 
@@ -175,25 +178,26 @@ async fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Serve(args) => {
             let parallel = args.parallel.max(1);
-            let (engine, model_name) = if parallel == 1 {
-                load_engine(&args.common)?
-            } else {
-                let (path, name) = prepare_model(&args.common.model, args.common.model_path.clone())?;
-                eprintln!("[bonjev] model: {}", path.display());
-                let mut engine = engine::Engine::load_seqs(
-                    &path,
-                    args.common.ctx,
-                    args.common.threads,
-                    args.common.ngl,
-                    parallel,
-                )?;
-                attach_vision(&mut engine, &args.common, name)?;
-                eprintln!(
-                    "[bonjev] loaded: vocab={} ctx={} parallel={parallel}",
-                    engine.n_vocab, args.common.ctx
-                );
-                (engine, format!("bonjev-{name}"))
-            };
+            // The context is split across slots (`n_ctx / slots` tokens each).
+            // Six slots keep a 4106-token prompt inside the default 32768 context
+            // and cover one Persian request, which is six questions.
+            let slots = parallel.clamp(6, 16);
+            let (path, name) = prepare_model(&args.common.model, args.common.model_path.clone())?;
+            eprintln!("[bonjev] model: {}", path.display());
+            let mut engine = engine::Engine::load_seqs(
+                &path,
+                args.common.ctx,
+                args.common.threads,
+                args.common.ngl,
+                slots,
+            )?;
+            attach_vision(&mut engine, &args.common, name)?;
+            eprintln!(
+                "[bonjev] loaded: vocab={} ctx={} parallel={parallel} slots={slots}",
+                engine.n_vocab, args.common.ctx
+            );
+            decision::load_choice_prior(&mut engine, args.common.ctx as usize / slots as usize)?;
+            let model_name = format!("bonjev-{name}");
             let state = Arc::new(if parallel == 1 {
                 server::direct(engine, model_name)
             } else {

@@ -1,6 +1,5 @@
 use crate::ffi::*;
-use anyhow::{anyhow, bail, Result};
-use std::collections::HashMap;
+use anyhow::{Result, anyhow, bail};
 use std::ffi::{CStr, CString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -11,7 +10,7 @@ pub struct Engine {
     pub n_vocab: usize,
     pub n_seq: usize,
     media_marker: Option<String>,
-    prior_cache: HashMap<String, Vec<f32>>,
+    prior_logits: Option<Vec<f32>>,
 }
 
 // SAFETY: `ctx` is owned by this value and is not shared. The type is moved between threads
@@ -27,22 +26,24 @@ fn prism_marker() -> &'static str {
 
 fn lib_dir() -> Result<PathBuf> {
     if let Ok(dir) = std::env::var("PRISM_LLAMA_DIR")
-        && !dir.is_empty() {
-            let path = PathBuf::from(&dir);
-            if !path.is_dir() {
-                bail!("PRISM_LLAMA_DIR is not a directory: {dir}");
-            }
-            return Ok(path);
+        && !dir.is_empty()
+    {
+        let path = PathBuf::from(&dir);
+        if !path.is_dir() {
+            bail!("PRISM_LLAMA_DIR is not a directory: {dir}");
         }
+        return Ok(path);
+    }
     let marker = prism_marker();
     let mut roots = Vec::new();
     if let Ok(cwd) = std::env::current_dir() {
         roots.push(cwd);
     }
     if let Ok(exe) = std::env::current_exe()
-        && let Some(parent) = exe.parent() {
-            roots.push(parent.to_path_buf());
-        }
+        && let Some(parent) = exe.parent()
+    {
+        roots.push(parent.to_path_buf());
+    }
     for root in roots {
         let mut dir = root;
         loop {
@@ -113,7 +114,7 @@ impl Engine {
             n_vocab: n_vocab as usize,
             n_seq: n_seq_i as usize,
             media_marker: None,
-            prior_cache: HashMap::new(),
+            prior_logits: None,
         })
     }
 
@@ -142,7 +143,13 @@ impl Engine {
         self.media_marker.as_deref()
     }
 
-    pub fn decode_rgb(&mut self, prompt: &str, rgb: &[u8], width: u32, height: u32) -> Result<usize> {
+    pub fn decode_rgb(
+        &mut self,
+        prompt: &str,
+        rgb: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<usize> {
         let expect = (width as usize)
             .checked_mul(height as usize)
             .and_then(|n| n.checked_mul(3));
@@ -172,12 +179,12 @@ impl Engine {
         Ok(n_tokens as usize)
     }
 
-    pub fn prior_get(&self, key: &str) -> Option<Vec<f32>> {
-        self.prior_cache.get(key).cloned()
+    pub fn prior_logits(&self) -> Option<&[f32]> {
+        self.prior_logits.as_deref()
     }
 
-    pub fn prior_put(&mut self, key: String, values: Vec<f32>) {
-        self.prior_cache.insert(key, values);
+    pub fn set_prior_logits(&mut self, logits: Vec<f32>) {
+        self.prior_logits = Some(logits);
     }
 
     pub fn tokenize(&self, text: &str, add_special: bool) -> Result<Vec<i32>> {
@@ -239,16 +246,26 @@ impl Engine {
     }
 
     /// One logit row per sequence, in input order. A single sequence uses the same decode as `decode`.
+    /// Several sequences that share a token prefix store that prefix once.
     pub fn decode_many(&mut self, seqs: &[Vec<i32>]) -> Result<Vec<Vec<f32>>> {
+        let borrowed: Vec<&[i32]> = seqs.iter().map(Vec::as_slice).collect();
+        self.decode_slices(&borrowed)
+    }
+
+    pub fn decode_slices(&mut self, seqs: &[&[i32]]) -> Result<Vec<Vec<f32>>> {
         if seqs.is_empty() {
             bail!("empty batch");
         }
         if seqs.len() == 1 {
-            self.decode(&seqs[0])?;
+            self.decode(seqs[0])?;
             return Ok(vec![self.logits()?.to_vec()]);
         }
         if seqs.len() > self.n_seq {
-            bail!("batch of {} sequences exceeds parallel {}", seqs.len(), self.n_seq);
+            bail!(
+                "batch of {} sequences exceeds parallel {}",
+                seqs.len(),
+                self.n_seq
+            );
         }
         for seq in seqs {
             if seq.is_empty() {
