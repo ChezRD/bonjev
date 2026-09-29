@@ -9,7 +9,12 @@ fn push_single_token(ids: &mut Vec<i32>, engine: &Engine, text: &str) -> Result<
     Ok(())
 }
 
-fn push_token_variants(ids: &mut Vec<i32>, engine: &Engine, variants: &[&str], merge_space: bool) -> Result<()> {
+fn push_token_variants(
+    ids: &mut Vec<i32>,
+    engine: &Engine,
+    variants: &[&str],
+    merge_space: bool,
+) -> Result<()> {
     for v in variants {
         push_single_token(ids, engine, v)?;
         if merge_space {

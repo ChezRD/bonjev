@@ -39,9 +39,10 @@ pub fn decode_base64(text: &str) -> Result<Rgb> {
 fn base64_payload(text: &str) -> &str {
     let text = text.trim();
     if let Some(rest) = text.strip_prefix("data:")
-        && let Some((_, payload)) = rest.split_once(',') {
-            return payload.trim();
-        }
+        && let Some((_, payload)) = rest.split_once(',')
+    {
+        return payload.trim();
+    }
     text
 }
 

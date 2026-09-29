@@ -10,9 +10,10 @@ fn require_linkable(dir: &str) {
 
 fn prism_dir() -> String {
     if let Ok(dir) = std::env::var("PRISM_LLAMA_DIR")
-        && !dir.is_empty() {
-            return dir;
-        }
+        && !dir.is_empty()
+    {
+        return dir;
+    }
 
     let rel = include_str!("prism-rel.txt").trim();
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -37,9 +38,11 @@ fn prism_dir() -> String {
             .status();
 
         if let Ok(st) = status
-            && st.success() && primary.is_dir() {
-                return primary.to_string_lossy().into_owned();
-            }
+            && st.success()
+            && primary.is_dir()
+        {
+            return primary.to_string_lossy().into_owned();
+        }
     }
 
     panic!(
@@ -53,18 +56,15 @@ fn main() {
     let dir = prism_dir();
     require_linkable(&dir);
 
-    let mtmd = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../vendor/prism-llama.cpp/tools/mtmd");
+    let mtmd =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../vendor/prism-llama.cpp/tools/mtmd");
     let mut builder = cc::Build::new();
-    builder
-        .file("c/src/shim.c")
-        .include("c/include");
+    builder.file("c/src/shim.c").include("c/include");
     if mtmd.is_dir() {
         builder.include(&mtmd);
         println!("cargo:rerun-if-changed={}", mtmd.display());
     }
-    builder
-        .flag_if_supported("-O2")
-        .compile("jf_shim");
+    builder.flag_if_supported("-O2").compile("jf_shim");
 
     println!("cargo:rustc-link-search=native={dir}");
     println!("cargo:rustc-link-lib=dylib=llama");

@@ -26,3 +26,10 @@ cc = "1"
 [profile.release]
 opt-level = 3
 lto = "thin"
+
+[lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+style = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
