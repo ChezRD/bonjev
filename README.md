@@ -49,10 +49,12 @@ BonJev loads GGUF models directly or downloads them through the Hugging Face Hub
 
 | Model ID | Repository | GGUF File | Disk Size |
 |---|---|---|---|
-| `q2` (default) | `prism-ml/Ternary-Bonsai-2-27B-gguf` | `Ternary-Bonsai-2-27B-PQ2_0.gguf` | 7.2 GB |
-| `q1` | `prism-ml/Bonsai-27B-gguf` | `Bonsai-27B-Q1_0.gguf` | 3.6 GB |
+| `bonsai2` (default) | `prism-ml/Ternary-Bonsai-2-27B-gguf` | `Ternary-Bonsai-2-27B-PQ2_0.gguf` | 7.2 GB |
+| `bonsai` | `prism-ml/Bonsai-27B-gguf` | `Bonsai-27B-Q1_0.gguf` | 3.6 GB |
 
-For `q2`, vision is enabled by default using the projector `Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf`. Pass `--no-vision` to disable it.
+`q2` still selects `bonsai2`. `q1` still selects `bonsai`. They are two models, not two quants of one file.
+
+Vision is on by default for both models. `bonsai2` loads `Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf`. `bonsai` loads `Bonsai-27B-mmproj-Q8_0.gguf`. Pass `--no-vision` to disable it.
 
 ## Building
 
@@ -103,7 +105,7 @@ At runtime, the binary locates shared libraries using the embedded rpath or `PRI
 Categorical decision:
 
 ```bash
-./target/release/bonjev ask --model q2 \
+./target/release/bonjev ask --model bonsai2 \
   --state "Customer requested a billing address update." \
   --question "Which department handles this request?" \
   --option "billing" \
@@ -114,7 +116,7 @@ Categorical decision:
 Multimodal decision with an image:
 
 ```bash
-./target/release/bonjev ask --model q2 \
+./target/release/bonjev ask --model bonsai2 \
   --image ./diagram.png \
   --state "Geometry problem diagram" \
   --question "What is the value of angle X?" \
@@ -126,7 +128,7 @@ Multimodal decision with an image:
 ### Start the HTTP Server
 
 ```bash
-./target/release/bonjev serve --model q2 --port 8080
+./target/release/bonjev serve --model bonsai2 --port 8080
 ```
 
 The server binds to `127.0.0.1:8080` and exposes two endpoints:
@@ -158,7 +160,7 @@ curl -X POST http://127.0.0.1:8080/v1/systemone \
 
 ```json
 {
-  "model": "bonjev-q2",
+  "model": "bonjev-bonsai2",
   "answers": {
     "decision": {
       "type": "choice",

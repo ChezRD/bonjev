@@ -5,20 +5,23 @@ pub struct ModelId {
     pub name: &'static str,
     pub repo: &'static str,
     pub file: &'static str,
+    pub mmproj: &'static str,
     pub about: &'static str,
 }
 
 const MODELS: &[ModelId] = &[
     ModelId {
-        name: "q2",
+        name: "bonsai2",
         repo: "prism-ml/Ternary-Bonsai-2-27B-gguf",
         file: "Ternary-Bonsai-2-27B-PQ2_0.gguf",
+        mmproj: "Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf",
         about: "Ternary-Bonsai-2-27B PQ2_0, 7.2 ГБ",
     },
     ModelId {
-        name: "q1",
+        name: "bonsai",
         repo: "prism-ml/Bonsai-27B-gguf",
         file: "Bonsai-27B-Q1_0.gguf",
+        mmproj: "Bonsai-27B-mmproj-Q8_0.gguf",
         about: "Bonsai-27B Q1_0, 3.6 ГБ",
     },
 ];
@@ -32,11 +35,11 @@ pub fn canonical(name: &str) -> Result<&'static ModelId> {
     MODELS
         .iter()
         .find(|model| match key.as_str() {
-            "q2" | "bonsai-q2" | "pq2" | "pq2_0" => model.name == "q2",
-            "q1" | "bonsai-q1" | "q1_0" => model.name == "q1",
+            "bonsai2" | "q2" | "bonsai-q2" | "pq2" | "pq2_0" => model.name == "bonsai2",
+            "bonsai" | "q1" | "bonsai-q1" | "q1_0" => model.name == "bonsai",
             _ => false,
         })
-        .ok_or_else(|| anyhow::anyhow!("unknown model '{name}' (use q2|q1)"))
+        .ok_or_else(|| anyhow::anyhow!("unknown model '{name}' (use bonsai2|bonsai)"))
 }
 
 /// Local Hugging Face cache only. Does not download.
@@ -54,14 +57,11 @@ pub fn download(model: &ModelId) -> Result<PathBuf> {
     download_file(model.repo, model.file)
 }
 
-pub const Q2_MMPROJ: &str = "Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf";
-
-pub fn q2_mmproj() -> Result<PathBuf> {
-    let repo = MODELS[0].repo;
-    if let Some(path) = cached_file(repo, Q2_MMPROJ) {
+pub fn mmproj(model: &ModelId) -> Result<PathBuf> {
+    if let Some(path) = cached_file(model.repo, model.mmproj) {
         return Ok(path);
     }
-    download_file(repo, Q2_MMPROJ)
+    download_file(model.repo, model.mmproj)
 }
 
 fn cached_file(repo: &str, file: &str) -> Option<PathBuf> {
@@ -81,8 +81,18 @@ mod tests {
 
     #[test]
     fn aliases_map_to_one_id() {
-        assert_eq!(canonical("PQ2_0").unwrap().name, "q2");
-        assert_eq!(canonical("q1_0").unwrap().name, "q1");
+        assert_eq!(canonical("PQ2_0").unwrap().name, "bonsai2");
+        assert_eq!(canonical("q2").unwrap().name, "bonsai2");
+        assert_eq!(canonical("q1_0").unwrap().name, "bonsai");
+        assert_eq!(canonical("q1").unwrap().name, "bonsai");
+        assert_eq!(
+            canonical("bonsai").unwrap().mmproj,
+            "Bonsai-27B-mmproj-Q8_0.gguf"
+        );
+        assert_eq!(
+            canonical("bonsai2").unwrap().mmproj,
+            "Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf"
+        );
         assert!(canonical("q3").is_err());
     }
 }

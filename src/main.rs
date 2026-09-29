@@ -37,8 +37,9 @@ enum Cmd {
 
 #[derive(Args)]
 struct ModelArgs {
-    /// q2 = Ternary-Bonsai-2-27B PQ2_0 (7.2 GB), q1 = Bonsai-27B Q1_0 (3.6 GB)
-    #[arg(long, default_value = "q2")]
+    /// bonsai2 = Ternary-Bonsai-2-27B PQ2_0 (7.2 GB), bonsai = Bonsai-27B Q1_0 (3.6 GB).
+    /// q2 and q1 still select those files.
+    #[arg(long, default_value = "bonsai2")]
     model: String,
     #[arg(long, default_value_t = 32768)]
     ctx: u32,
@@ -49,7 +50,7 @@ struct ModelArgs {
     /// Use a local GGUF instead of the HF cache
     #[arg(long)]
     model_path: Option<PathBuf>,
-    /// Vision projector. For q2 the Q8 mmproj is downloaded when this is omitted.
+    /// Vision projector. The model's Q8 mmproj is downloaded when this is omitted.
     #[arg(long)]
     mmproj: Option<PathBuf>,
     /// Do not load a vision projector.
@@ -145,11 +146,10 @@ fn attach_vision(engine: &mut engine::Engine, args: &ModelArgs, model_name: &str
             bail!("vision projector not found: {}", path.display());
         }
         path.clone()
-    } else if model_name == "q2" {
-        eprintln!("[bonjev] vision projector: {}", hf::Q2_MMPROJ);
-        hf::q2_mmproj()?
     } else {
-        return Ok(());
+        let model = hf::canonical(model_name)?;
+        eprintln!("[bonjev] vision projector: {}", model.mmproj);
+        hf::mmproj(model)?
     };
     eprintln!("[bonjev] vision: {}", path.display());
     engine.load_vision(&path, args.threads)?;
