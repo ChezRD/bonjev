@@ -56,21 +56,39 @@ For `q2`, vision is enabled by default using the projector `Ternary-Bonsai-2-27B
 
 ## Building
 
-### Prerequisites
+### Quick Start
 
-- Rust toolchain (2021 edition)
-- C compiler (`gcc` or `clang`)
-- Prebuilt Prism libraries (`libllama.so`, `libmtmd.so`, `libggml.so`)
+Prerequisites: Rust (2024 edition or newer), C compiler (`gcc` or `clang`), `curl`.
 
-### Compilation
+```bash
+git clone https://github.com/ChezRD/bonjev.git
+cd bonjev
+cargo build --release
+```
 
-Set `PRISM_LLAMA_DIR` to the directory containing prebuilt Prism libraries:
+`build.rs` automatically runs `./scripts/fetch-prism.sh` to download and unpack the pinned Prism prebuilts (`prism-b10743-adfffbe`) into `vendor/prism-prebuilt/` if they are not already present. On Linux with an NVIDIA GPU, it auto-detects CUDA; otherwise, it falls back to the CPU archive.
+
+### Manual / Custom Backend
+
+To pre-download a specific backend before building:
+
+```bash
+./scripts/fetch-prism.sh               # auto-detects CUDA / CPU
+./scripts/fetch-prism.sh cuda-13.3      # Linux x64 CUDA 13.3
+./scripts/fetch-prism.sh cuda-12.8      # Linux x64 CUDA 12.8
+./scripts/fetch-prism.sh cuda-12.4      # Linux x64 CUDA 12.4
+./scripts/fetch-prism.sh vulkan         # Linux x64 Vulkan
+./scripts/fetch-prism.sh rocm           # Linux x64 ROCm 7.2
+./scripts/fetch-prism.sh cpu            # Linux / macOS CPU
+```
+
+Or point `PRISM_LLAMA_DIR` to existing prebuilt libraries:
 
 ```bash
 PRISM_LLAMA_DIR=/path/to/prism-prebuilt cargo build --release
 ```
 
-If `PRISM_LLAMA_DIR` is not set, `build.rs` reads the path from `prism-rel.txt`. At runtime, the binary locates shared libraries using embedded rpath or `PRISM_LLAMA_DIR`.
+At runtime, the binary locates shared libraries using the embedded rpath or `PRISM_LLAMA_DIR`.
 
 ## Usage
 

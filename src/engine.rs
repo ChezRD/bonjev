@@ -26,25 +26,23 @@ fn prism_marker() -> &'static str {
 }
 
 fn lib_dir() -> Result<PathBuf> {
-    if let Ok(dir) = std::env::var("PRISM_LLAMA_DIR") {
-        if !dir.is_empty() {
+    if let Ok(dir) = std::env::var("PRISM_LLAMA_DIR")
+        && !dir.is_empty() {
             let path = PathBuf::from(&dir);
             if !path.is_dir() {
                 bail!("PRISM_LLAMA_DIR is not a directory: {dir}");
             }
             return Ok(path);
         }
-    }
     let marker = prism_marker();
     let mut roots = Vec::new();
     if let Ok(cwd) = std::env::current_dir() {
         roots.push(cwd);
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent() {
             roots.push(parent.to_path_buf());
         }
-    }
     for root in roots {
         let mut dir = root;
         loop {

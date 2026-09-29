@@ -1,23 +1,57 @@
 use std::path::{Path, PathBuf};
 
+fn require_linkable(dir: &str) {
+    let root = Path::new(dir);
+    if root.join("libllama.so").is_file() || root.join("libllama.dylib").is_file() {
+        return;
+    }
+    panic!("libllama.so or libllama.dylib not found in {dir}");
+}
+
 fn prism_dir() -> String {
-    if let Ok(dir) = std::env::var("PRISM_LLAMA_DIR") {
-        if !dir.is_empty() {
+    if let Ok(dir) = std::env::var("PRISM_LLAMA_DIR")
+        && !dir.is_empty() {
             return dir;
         }
-    }
+
     let rel = include_str!("prism-rel.txt").trim();
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join(rel)
-        .to_string_lossy()
-        .into_owned()
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+    let primary = manifest.join(rel);
+    if primary.is_dir() {
+        return primary.to_string_lossy().into_owned();
+    }
+
+    let beside = manifest.join("..").join(rel);
+    if beside.is_dir() {
+        return beside.to_string_lossy().into_owned();
+    }
+
+    // Automatically download prebuilts if missing
+    let script = manifest.join("scripts/fetch-prism.sh");
+    if script.is_file() {
+        println!("cargo:warning=Prism libraries not found, running scripts/fetch-prism.sh...");
+        let status = std::process::Command::new("sh")
+            .arg(&script)
+            .current_dir(&manifest)
+            .status();
+
+        if let Ok(st) = status
+            && st.success() && primary.is_dir() {
+                return primary.to_string_lossy().into_owned();
+            }
+    }
+
+    panic!(
+        "Prism llama directory not found: {rel}\n\
+         Run ./scripts/fetch-prism.sh to download prebuilt libraries,\n\
+         or set PRISM_LLAMA_DIR to a directory with libllama.so or libllama.dylib."
+    );
 }
 
 fn main() {
     let dir = prism_dir();
-    if !Path::new(&dir).is_dir() {
-        panic!("prism llama directory not found: {dir} (set PRISM_LLAMA_DIR)");
-    }
+    require_linkable(&dir);
 
     let mtmd = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../vendor/prism-llama.cpp/tools/mtmd");
     let mut builder = cc::Build::new();
@@ -37,7 +71,9 @@ fn main() {
     println!("cargo:rustc-link-lib=dylib=mtmd");
     println!("cargo:rustc-link-lib=dylib=ggml");
     println!("cargo:rustc-link-lib=dylib=ggml-base");
-    println!("cargo:rustc-link-arg=-Wl,-rpath,{dir}");
+    if cfg!(unix) {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{dir}");
+    }
     println!("cargo:rerun-if-env-changed=PRISM_LLAMA_DIR");
     println!("cargo:rerun-if-changed=prism-rel.txt");
     println!("cargo:rerun-if-changed=c/src/shim.c");

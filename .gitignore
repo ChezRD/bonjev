@@ -2,3 +2,4 @@
 **/*.rs.bk
 *.log
 .DS_Store
+/vendor/prism-prebuilt/

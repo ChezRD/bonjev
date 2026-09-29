@@ -355,11 +355,10 @@ fn take_picture(req: &Request) -> Result<Option<Rgb>> {
     }
     if let StateValue::Other(Value::Object(map)) = &req.state {
         for key in IMAGE_STATE_KEYS {
-            if let Some(Value::String(text)) = map.get(*key) {
-                if !text.trim().is_empty() {
+            if let Some(Value::String(text)) = map.get(*key)
+                && !text.trim().is_empty() {
                     return Ok(Some(picture::decode_base64(text)?));
                 }
-            }
         }
     }
     Ok(None)
@@ -380,11 +379,10 @@ fn decide_from_logits(
     prior: Option<&[f32]>,
 ) -> Result<Response> {
     let mut slots = slot_logits(logits, label_forms);
-    if let Some(p) = prior {
-        if p.len() == slots.len() {
+    if let Some(p) = prior
+        && p.len() == slots.len() {
             slots = apply_prior_calibration(&slots, p, prior_alpha());
         }
-    }
     let probs = softmax_slots(&slots);
     if probs.len() != row.options.len() {
         bail!("probability count does not match options");
