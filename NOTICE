@@ -1,0 +1,24 @@
+BonJev
+Copyright (c) 2026 the BonJev authors
+SPDX-License-Identifier: MIT
+
+This file covers the Rust sources and c/src/shim.c in this directory.
+It does not cover model weights.
+
+Third-party code linked or copied in:
+
+- llama.cpp, mtmd, ggml. MIT, Copyright (c) 2023-2026 The ggml authors.
+  Text: vendor/prism-llama.cpp/LICENSE
+  and vendor/prism-prebuilt/llama-prism-b10743-adfffbe/LICENSE.
+  The binary links libllama.so, libmtmd.so, libggml.so, libggml-base.so.
+  API headers under c/include (except shim.h) are copied from that tree.
+
+- Rust crates named in Cargo.toml. Direct crates are MIT, Apache-2.0,
+  or MIT OR Apache-2.0. See each crate's license. Transitive crates
+  were not enumerated here.
+
+Bonsai and Ternary-Bonsai GGUF files are downloaded by the user.
+They are not in this tree. The Hugging Face card for
+prism-ml/Ternary-Bonsai-2-27B-gguf states license: apache-2.0
+for that model artifact and names Qwen/Qwen3.8-27B as the base model.
+Weight terms are separate from this MIT file.
