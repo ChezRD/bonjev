@@ -4,3 +4,4 @@
 .DS_Store
 /vendor/prism-prebuilt/
 /benchmarks/cache/
+__pycache__/
