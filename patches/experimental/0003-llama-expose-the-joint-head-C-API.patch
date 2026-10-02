@@ -1,0 +1,59 @@
+From d9c289e96cc9cf25337f1a5d1f49d02ef8eb1320 Mon Sep 17 00:00:00 2001
+From: bonjev <bonjev@local>
+Date: Fri, 2 Oct 2026 03:31:20 +0300
+Subject: [PATCH 3/3] llama: expose the joint head C API
+
+---
+ include/llama.h | 36 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 36 insertions(+)
+
+diff --git a/include/llama.h b/include/llama.h
+index deb1e1282..f11a61c3a 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -1068,6 +1068,42 @@ extern "C" {
+     // otherwise: float[n_embd] (1-dimensional)
+     LLAMA_API float * llama_get_embeddings_seq(struct llama_context * ctx, llama_seq_id seq_id);
+ 
++    //
++    // Clef joint schema head layer (optional extra layer on top of the backbone)
++    //
++
++    // Geometry and inputs for one head-layer call. Arrays are in ggml layout
++    // (first dimension contiguous).
++    struct llama_head_record_c {
++        int32_t n_tokens;
++        int32_t n_questions;
++        int32_t n_options;
++
++        const float   * a_q;        // [n_tokens, n_questions]  question span means
++        const float   * a_o;        // [n_tokens, n_options]    option context span means
++        const float   * oq;         // [n_questions, n_options] option -> question one-hot
++        const float   * mask;       // [n_options, n_questions] softmax mask (0 / -inf)
++        const float   * lex;        // [n_options, n_embd]      lexical vectors per option
++        const int32_t * type_ids;   // [n_questions]            0=noul, 1=choice, 2=score
++        int32_t last_token;         // index of the last token of the sequence
++    };
++
++    // Load the head layer weights from a GGUF packed from the published
++    // joint_head.safetensors (see bonjev's benchmarks/head_to_gguf.py).
++    LLAMA_API bool llama_head_load(struct llama_context * ctx, const char * path);
++
++    // Set the per-request inputs of the head stage. Call before decoding the
++    // prompt; hidden states of each decoded chunk are collected automatically
++    // and the head runs in the model graph of the final chunk.
++    LLAMA_API bool llama_head_set_record(
++            struct llama_context * ctx,
++            const struct llama_head_record_c * record);
++
++    // Arm the head stage for the next decode: the head's inputs are uploaded
++    // and the graph of the next decoded chunk runs the head on the whole
++    // sequence. Its logits are published through llama_get_logits().
++    LLAMA_API bool llama_head_finalize(struct llama_context * ctx);
++
+     //
+     // backend sampling API [EXPERIMENTAL]
+     // note: use only if the llama_context was created with at least one llama_sampler_seq_config
+-- 
+2.55.0
+

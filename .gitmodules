@@ -1,0 +1,3 @@
+[submodule "vendor/prism-llama.cpp"]
+	path = vendor/prism-llama.cpp
+	url = https://github.com/PrismML-Eng/llama.cpp

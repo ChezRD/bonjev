@@ -1,0 +1,292 @@
+From 1a3d3b009c1f1140b7c9cf7c72783b1e7e84130c Mon Sep 17 00:00:00 2001
+From: bonjev <bonjev@local>
+Date: Fri, 2 Oct 2026 03:31:20 +0300
+Subject: [PATCH 2/3] llama: graft the joint head into the context graph and
+ model loader
+
+---
+ src/llama-context.cpp | 115 ++++++++++++++++++++++++++++++++++++++++++
+ src/llama-context.h   |  24 +++++++++
+ src/llama-graph.h     |  10 ++++
+ src/llama-model.cpp   |  20 ++++++++
+ 4 files changed, 169 insertions(+)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index cc8c004eb..22b3c45b8 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -604,6 +604,12 @@ llama_context::~llama_context() {
+         }
+     }
+     ggml_opt_free(opt_ctx);
++
++    head_layer_free(head);
++    if (head_backend) {
++        ggml_backend_free(head_backend);
++        head_backend = nullptr;
++    }
+ }
+ 
+ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
+@@ -2070,6 +2076,28 @@ int llama_context::decode(const llama_batch & batch_inp) {
+             }
+         }
+ 
++        // Clef head stage: collect this chunk's final-norm hidden states, and
++        // once armed, publish the head's logits through the regular output.
++        if (head_collect && embd_nextn.data != nullptr && embd_nextn.size > 0) {
++            head_acc.insert(head_acc.end(), embd_nextn.data, embd_nextn.data + embd_nextn.size);
++        }
++        fprintf(stderr, "decode: armed=%d head_logits=%p\n", (int) head_armed, (void *) res->t_head_logits);
++        if (head_armed && res->t_head_logits != nullptr) {
++            {
++                float hh[4] = {0}, ll[4] = {0};
++                struct ggml_tensor * ht = res->get_h_nextn();
++                if (ht) { ggml_backend_tensor_get(ht, hh, 0, sizeof(hh)); }
++                ggml_backend_tensor_get(res->t_head_logits, ll, 0, sizeof(ll));
++                fprintf(stderr, "h_nextn[0..3]=%g %g %g %g  head_logits[0..3]=%g %g %g %g\n",
++                        hh[0], hh[1], hh[2], hh[3], ll[0], ll[1], ll[2], ll[3]);
++            }
++            float * out = get_logits_ith(-1);
++            if (out != nullptr) {
++                ggml_backend_tensor_get(res->t_head_logits, out, 0, (size_t) head.rec_n_options * sizeof(float));
++            }
++            head_armed = false;
++        }
++
+         // plot the computation graph in dot format (for debugging purposes)
+         //if (n_past%100 == 0) {
+         //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
+@@ -2739,6 +2767,7 @@ llm_graph_params llama_context::graph_params(
+         /*.n_outputs   =*/n_outputs,
+         /*.cb          =*/graph_get_cb(),
+         /*.res         =*/res,
++        /*.head        =*/head_armed ? &head : nullptr,
+     };
+ }
+ 
+@@ -4526,3 +4555,89 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
+ llama_context * llama_get_ctx_other(struct llama_context * ctx) {
+     return ctx->get_cparams().ctx_other;
+ }
++
++
++//
++// Clef joint schema head layer
++//
++
++bool llama_context::head_load(const char * path) {
++    if (!path) {
++        return false;
++    }
++    if (!head_backend) {
++        ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
++        if (!dev) {
++            dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++        }
++        if (!dev) {
++            return false;
++        }
++        head_backend = ggml_backend_dev_init(dev, nullptr);
++        if (!head_backend) {
++            return false;
++        }
++    }
++    return head_layer_load(head, path, head_backend);
++}
++
++bool llama_context::head_set_record(const struct llama_head_record_c * record) {
++    if (!record || record->n_tokens <= 0 || record->n_questions <= 0 || record->n_options <= 0 ||
++        !record->a_q || !record->a_o || !record->oq || !record->mask || !record->lex || !record->type_ids) {
++        return false;
++    }
++    head_n_tokens    = record->n_tokens;
++    head_n_questions = record->n_questions;
++    head_n_options   = record->n_options;
++    head_last        = record->last_token;
++    head_a_q.assign(record->a_q, record->a_q + (size_t) head_n_tokens * head_n_questions);
++    head_a_o.assign(record->a_o, record->a_o + (size_t) head_n_tokens * head_n_options);
++    head_oq.assign(record->oq, record->oq + (size_t) head_n_questions * head_n_options);
++    head_mask.assign(record->mask, record->mask + (size_t) head_n_options * head_n_questions);
++    head_lex.assign(record->lex, record->lex + (size_t) head_n_options * head.hidden_size);
++    head_type.assign(record->type_ids, record->type_ids + head_n_questions);
++    head_acc.clear();
++    head_collect = true;
++    head_armed = false;
++    return true;
++}
++
++bool llama_context::head_finalize() {
++    fprintf(stderr, "head_finalize: collect=%d nq=%d no=%d backend=%p acc=%zu\n",
++            (int) head_collect, head_n_questions, head_n_options, (void *) head_backend, head_acc.size());
++    if (!head_collect || head_n_questions <= 0 || head_n_options <= 0 || head_backend == nullptr) {
++        return false;
++    }
++    llama_head_record rec;
++    rec.n_tokens    = head_n_tokens;
++    rec.n_questions = head_n_questions;
++    rec.n_options   = head_n_options;
++    rec.a_q         = head_a_q.data();
++    rec.a_o         = head_a_o.data();
++    rec.oq          = head_oq.data();
++    rec.mask        = head_mask.data();
++    rec.lex         = head_lex.data();
++    rec.type_ids    = head_type.data();
++    rec.last_token  = head_last;
++    const int acc_rows = (int) (head_acc.size() / (size_t) head.hidden_size);
++    if (!head_prepare(head, head_backend, rec, head_acc.data(), acc_rows)) {
++        fprintf(stderr, "head_finalize: head_prepare failed\n");
++        return false;
++    }
++    fprintf(stderr, "head_finalize: armed acc_rows=%d\n", acc_rows);
++    head_collect = false;
++    head_armed = true;
++    return true;
++}
++
++bool llama_head_load(struct llama_context * ctx, const char * path) {
++    return ctx && ctx->head_load(path);
++}
++
++bool llama_head_set_record(struct llama_context * ctx, const struct llama_head_record_c * record) {
++    return ctx && ctx->head_set_record(record);
++}
++
++bool llama_head_finalize(struct llama_context * ctx) {
++    return ctx && ctx->head_finalize();
++}
+diff --git a/src/llama-context.h b/src/llama-context.h
+index ef0c3a50d..3e50308a3 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -4,6 +4,7 @@
+ #include "llama-ext.h"
+ #include "llama-cparams.h"
+ #include "llama-graph.h"
++#include "llama-head.h"
+ #include "llama-adapter.h"
+ #include "llama-impl.h"
+ #include "llama-memory.h"
+@@ -90,6 +91,11 @@ struct llama_context {
+ 
+     float * get_embeddings_layer_inp(uint32_t lid);
+ 
++    // Clef joint schema head layer (see llama-head.h)
++    bool head_load(const char * path);
++    bool head_set_record(const struct llama_head_record_c * record);
++    bool head_finalize();
++
+     // multi-layer hidden-state tap (EAGLE3 / dspark target-feature reuse).
+     // get_embeddings_capture_ith returns the concatenated [n_capture * n_embd] row
+     // for output position i, captured layers laid out in capture order.
+@@ -310,6 +316,24 @@ private:
+     // instead of riding batch.token/embd.
+     llama_dspark_ctx dspark_ctx;
+ 
++    // optional Clef joint schema head layer (see llama-head.h)
++    llama_head head;
++    ggml_backend_t head_backend = nullptr;
++    // head stage state: record set -> collect hidden states -> arm -> extract
++    bool head_armed = false;
++    bool head_collect = false;
++    std::vector<float> head_acc;
++    std::vector<float> head_a_q;
++    std::vector<float> head_a_o;
++    std::vector<float> head_oq;
++    std::vector<float> head_mask;
++    std::vector<float> head_lex;
++    std::vector<int32_t> head_type;
++    int head_n_tokens = 0;
++    int head_n_questions = 0;
++    int head_n_options = 0;
++    int32_t head_last = 0;
++
+     // decode output (2-dimensional array: [n_outputs][n_vocab])
+     buffer_view<float> logits = {nullptr, 0};
+ 
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index e85c1aa20..4504d43df 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -118,6 +118,7 @@ struct llama_dspark_ctx {
+     std::vector<int32_t> v_ctx_pos;  // [n_ctx_rows], absolute position id per context row
+ };
+ struct llm_graph_params;
++struct llama_head;
+ 
+ //
+ // llm_graph_input
+@@ -887,9 +888,15 @@ struct llm_graph_params {
+ 
+     llm_graph_result * res;
+ 
++    // optional Clef head stage grafted into the model graph
++    const struct llama_head * head;
++
+     // return true if the "other" params would result in a graph with the same topology as with the current params
+     //   having the same topology allows us to reuse the graph in some cases
+     bool allow_reuse(const llm_graph_params & other) const {
++        if (head != other.head) {
++            return false;
++        }
+         // first check the ubatch
+         bool can_reuse_ubatch =
+             ubatch.equal_seqs() == other.ubatch.equal_seqs() &&
+@@ -988,6 +995,7 @@ public:
+     ggml_tensor * get_embd()        const { return t_embd; }
+     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
+     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
++    ggml_tensor * get_head_logits() const { return t_head_logits; }
+ 
+     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
+ 
+@@ -1030,6 +1038,8 @@ public:
+     // by the per-model graph builder when cparams.n_capture_layers > 0.
+     ggml_tensor * t_h_capture   = nullptr;
+     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
++    // per-option logits of the Clef head stage (see llama-head.h)
++    ggml_tensor * t_head_logits = nullptr;
+ 
+     std::vector<ggml_tensor *> t_layer_inp;
+ 
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 191d025e2..8a29adead 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -20,6 +20,7 @@
+ 
+ #include "llama.h"
+ #include "models/models.h"
++#include "llama-head.h"
+ 
+ #include "ggml.h"
+ #include "ggml-cpp.h"
+@@ -2926,6 +2927,25 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
+ 
+     llm->res->set_outputs(params);
+ 
++    // Clef head stage: grafted between the final norm and the output layer.
++    // The hidden states of previous chunks are concatenated with this chunk's
++    // final-norm states, so the head sees the whole sequence.
++    if (params.head != nullptr) {
++        struct ggml_context * ctx = llm->res->get_ctx();
++        struct ggml_tensor  * h   = llm->res->get_h_nextn();
++        if (ctx != nullptr && h != nullptr) {
++            if (params.head->t_acc != nullptr) {
++                h = ggml_concat(ctx, params.head->t_acc, h, 1);
++            }
++            struct ggml_tensor * head_logits = head_build_graph(ctx, *params.head, h);
++            if (head_logits != nullptr) {
++                llm->res->t_head_logits = head_logits;
++                ggml_set_output(head_logits);
++                ggml_build_forward_expand(llm->res->get_gf(), head_logits);
++            }
++        }
++    }
++
+     return llm->res->get_gf();
+ }
+ 
+-- 
+2.55.0
+
