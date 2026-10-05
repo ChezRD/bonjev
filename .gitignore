@@ -2,6 +2,32 @@
 **/*.rs.bk
 *.log
 .DS_Store
-/vendor/prism-prebuilt/
-/benchmarks/cache/
 __pycache__/
+
+# Downloaded or locally built llama.cpp libraries
+/vendor/prism-prebuilt/
+/vendor/linux-*/
+/vendor/win-*/
+/tooling/
+
+# Generated benchmark output
+/benchmarks/cache/
+
+# Local working artifacts (LoRA parts, merges, GGUF adapters, bases)
+/work/
+/archived/
+
+# Compiled artifacts and patch leftovers
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.orig
+*.rej
+
+# Model weights (live in the HF cache, not in the repo)
+*.gguf
+*.safetensors
