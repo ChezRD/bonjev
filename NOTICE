@@ -22,3 +22,25 @@ They are not in this tree. The Hugging Face card for
 prism-ml/Ternary-Bonsai-2-27B-gguf states license: apache-2.0
 for that model artifact and names Qwen/Qwen3.8-27B as the base model.
 Weight terms are separate from this MIT file.
+
+LoRA adapters and their sources
+-------------------------------
+
+The LoRA adapters distributed with BonJev (work/best/, and the Hugging Face
+adapter repositories) are training-free recombinations of third-party decision
+LoRA deltas. The source models are all Apache-2.0, so the resulting adapters are
+distributed under the Apache License 2.0 as well; the sources are listed, with
+licenses and notices, in docs/ATTRIBUTION.md.
+
+Sources in the published adapters (all Apache-2.0):
+  lostargon/Tiny-Jev, jaredpalmer/kev-4b, CullenYap/CandiGate-Qwen3-4B,
+  sennaLLMLearner/qwen3-4b-system-one-lora, jaredpalmer/kev-8b,
+  CaoHaoWei/Jev-LCT-Qwen3-8B, Cloudflare/clef,
+  totum-labs/Qwen3.5-27B-plumb, vllm-sr/Decision-2.0-Vega-27B.
+
+Sources used in experiments and all base models are Apache-2.0; the full list is
+in docs/ATTRIBUTION.md.
+
+Considered but not used, and therefore not in any adapter:
+  HopitAI/hopper (research and demo use only),
+  dhtocks/malkuth-4b (CC-BY-NC-4.0, non-commercial).

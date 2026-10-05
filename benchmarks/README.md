@@ -1,70 +1,108 @@
 # Benchmark notes
 
-These notes are for someone checking a number in the [performance table](../README.md). Each file says how that run was scored, which questions were left out, and which misses remain after that cut.
+How the published numbers are produced. There are two suites: the public **JevBench-231** exam and the
+external **Decision Index** (DI). Per-model guidance is in `RECOMMENDATIONS.md`; the consolidated
+tables are in `RESULTS.md`; how each LoRA was built is in [`../docs/RECIPES.md`](../docs/RECIPES.md).
 
-## Public exam
+## Public exam (JevBench-231)
 
 ```bash
 python3 benchmarks/jevbench_exam.py
 ```
 
-The script downloads the pinned JevBench public splits (`easy`, `original`, `hard`, 231 tasks, commit `3749b4fc`) into `benchmarks/cache/jevbench/` and scores them with `POST /v1/systemone`. A file whose sha256 already matches is not downloaded again. `--refresh` forces a new download.
+The script downloads the pinned JevBench public splits (`easy`, `original`, `hard`, 231 tasks, commit
+`3749b4fc`) into `benchmarks/cache/jevbench/` and scores them with `POST /v1/systemone`. A file whose
+sha256 already matches is not downloaded again; `--refresh` forces a new download.
 
-The default endpoint is `http://127.0.0.1:8830/v1/systemone`. If nothing is listening there, the script starts `target/release/bonjev serve --model bonsai2 --port 8830` and stops that process when the run ends. A server that is already up is left running. Point `--url` at another server. Per-task rows go to `benchmarks/cache/jevbench/exam.jsonl`.
+The default endpoint is `http://127.0.0.1:8830/v1/systemone`. If nothing is listening there, the script
+starts `target/release/bonjev serve --model ternary-bonsai-2-27b --port 8830 --ctx 16384` and stops that
+process when the run ends. A server that is already up is left running; point `--url` at another server.
+Per-task rows go to `benchmarks/cache/jevbench/exam.jsonl`.
 
-The published `bonsai2` numbers use the release binary on an NVIDIA RTX 4060 Ti 16 GB, context 32,768. `q2` is the old name of that same file. Later suites are one HTTP request at a time to `POST /v1/systemone` on port 8830. No client SDK.
+Run it for one model + LoRA with `scripts/eval_exam.sh <model> <lora|-> <out.jsonl>`, which also writes a
+probability dump (`--dump-probs`) and prints `answer_first` / `margin` / `m_wrong`. The selection metrics
+(`rank3%`, `m_wrong`, `answer_first`) are described in `RECOMMENDATIONS.md`.
 
-A **choice** is correct when the option with the highest probability is the author label. A **yes/no** question is correct when the probability of `true` is on the same side of 0.5 as the author label. A **score** is correct when the level with the highest probability equals the author level. The probability-weighted average is recorded and is not the grade.
+The published numbers use the release binary, **deterministic mode** (`BONJEV_NO_REUSE=1`), 16384
+context, one HTTP request at a time on port 8830, no client SDK.
 
-[sys1bench](https://github.com/rssr25/system-one-bench) is the base template only (framing `f0`). The paraphrase sweep was not run. Each generator was called with `n=500` and `seed=42`. The [canary](https://github.com/rssr25/system-one-bench/blob/main/src/sys1bench/data/canary/canary.jsonl) is the frozen set in that repository: 100 tickets and 100 phishing emails, seed 9001.
+Grading: a **choice** is correct when the highest-probability option is the author label; a **yes/no**
+question when the probability of `true` is on the same side of 0.5 as the author label; a **score** when
+the highest-probability level equals the author level. The probability-weighted average is recorded but
+is not the grade.
 
-Choice criteria that arrived as a list of `{key, description}` were sent as a map, because BonJev ignores a choice list. Score criteria that arrived as `{level, description}` were sent as a list of the description strings, so the keys are `"0"`, `"1"`, and so on. An empty passage description was replaced with the passage id.
+Serving styles: the engine's default routing is `native_user` for choice and `answer` for yes/no and
+score (chosen by the style sweep); `BONJEV_STYLE=top3` averages three styles and is used for 1.7B.
 
-## How 2,531 / 3,093 is built
+## Decision Index (DI)
 
-Seven score questions, 500 items each, before any cut: **2,556 / 3,500**.
+The arbiter for LoRA selection is the external **Decision Index** kit
+([github.com/apolinario/decision-index](https://github.com/apolinario/decision-index), edition 0.2.1).
+All DI runs here are on **`ternary-bonsai-2-27b`** (Bonsai 2, Qwen3.8); the v1 `ternary-bonsai-27b` was
+not run on DI.
+A copy is kept under `archived/benchmarks/decision-index/`; install the kit from upstream to reproduce:
 
-| Question | Raw | Left out | Hits inside the cut | After the cut |
-| --- | ---: | ---: | ---: | ---: |
-| English ticket priority | 246 / 500 | 75 | 0 | 246 / 425 |
-| Multilingual ticket priority | 280 / 500 | 24 | 0 | 280 / 476 |
-| Phishing urgency | 308 / 500 | 98 | 0 | 308 / 402 |
-| Passage relevance | 362 / 500 | 140 | 14 | 348 / 360 |
-| Guardrail risk | 441 / 500 | 70 | 11 | 430 / 430 |
-| Policy severity | 419 / 500 | 0 | 0 | 419 / 500 |
-| Log severity | 500 / 500 | 0 | 0 | 500 / 500 |
-| **Sum** | **2,556 / 3,500** | **407** | **25** | **2,531 / 3,093 (81.8%)** |
+```bash
+pip install "decision-index"            # or: pip install -e <path-to-the-kit>
+```
 
-A left-out question is removed from both the numerator and the denominator. When the model matched a broken author label, that hit is removed too. That is why passage relevance loses 14 hits and guardrail risk loses 11.
+**Suite rows.** The kit reads the frozen suite. Fetch/build it with the kit:
 
-The same two ticket and phishing rules on the canary remove 41 score questions, all of them misses: **107 / 200** becomes **107 / 159**. Choice and yes/no on the canary stay **888 / 900**.
+```bash
+python -m decision_index suite download --dir ~/.cache/huggingface/decision-index
+# or rebuild from pinned sources: python -m decision_index suite rebuild --work work
+```
 
-## Questions left out because the item contradicts itself
+Rows land in `~/.cache/huggingface/decision-index/artifacts/benchmark-suite/release-v2-rebuilt/`
+(`selected-rows.jsonl.gz` + `added-rows.jsonl.gz`). Build samples with the kit's stratified sampler:
 
-**489** questions are out of the published scores.
+```bash
+python -m decision_index suite sample --edition 0.2.1 --n 300 --out sample-300.jsonl.gz
+```
 
-| Suite | Left out | What contradicts what |
-| --- | ---: | --- |
-| sys1bench main score | 407 | See the table above. Detail is in the suite notes. |
-| sys1bench canary score | 41 | 13 ticket priorities with author level 0 on a real request, and 28 phishing urgencies (Thursday lunch, and "open to review"). |
-| typed-decisions | 36 | The author caption says the invoice matches. The same record shows another quantity, a repeated invoice id, or a purchase order with no id. 31 of these the model matched. 5 it did not. |
-| AY prompt injection | 5 | Ordinary requests labeled as injections: a film plot (`inj:315`), a book question (`inj:543`), `generate c++` (`inj:171`), and two SQL requests (`inj:584`, `inj:654`). All five were misses, so **349 / 400** becomes **349 / 395**. |
+Samples used here: `sample-300`; `sample-500-hybrid` (the kit's `--n 500` minus rows over 16k
+`proxy_tokens` = 491 rows); `sample-1500`. The kit applies the scoring subsets at read time (ACOS is
+scored on 400 of its 1399 reviews; ToolRet/BRIGHT only answerable queries; Home-appliance deduplicated).
 
-## Suite notes
+**Run.** `scripts/di_run.sh` starts our server, runs the kit against it, and scores:
 
-- [Support tickets](sys1bench-tickets.md). 375 priority misses remain (179 English, 196 multilingual). The author level matches the printed formula. The model follows the level caption and lands one step off.
-- [Phishing and logs](sys1bench-phishing-and-logs.md). 175 real misses: 43 timesheets, 51 invoices, 81 paging decisions.
-- [Passages, guardrails, and policy](sys1bench-passages-policy.md). 12 passage misses and 130 policy misses remain. Guardrail risk has no remaining misses. The 49 intent misses are the same jailbreak-plus-harm sentences already cut from the risk score.
-- [SST-2, AY injection, typed-decisions](sst2-ay-typed-decisions.md).
+```bash
+scripts/di_run.sh <name> <model> <lora|-> <rows.jsonl.gz> [limit]
+# e.g.
+DI_CTX=16384 scripts/di_run.sh d1500_4_b10 ternary-bonsai-4b work/best/4b/B10.gguf sample-1500.jsonl.gz
+```
 
-## Runs with no questions removed
+It calls `python -m decision_index run --engine http --option base_url=http://127.0.0.1:8830
+--option model=<name> --rows <rows> --out benchmarks/cache/di/<name>` and then
+`python -m decision_index score --results ... --suite-dir <suite>`. Env: `DI_PYTHON` (the kit's python),
+`DI_CTX` (context, default 32768; we use 16384 for the hybrid/1500 samples), `PRISM_LLAMA_DIR`. Runs are
+serialized through a lock (one GPU).
 
-These rows in the performance table are the full set. Nothing in them was dropped for a self-contradiction.
+**Scoring.** The kit's `scores.json` holds each track's **native** primary metric (accuracy / macro-F1 /
+nDCG@10 / per-review F1 / Brier). We compare configurations by **`A_native`** = the equal-weight mean of
+the per-track native scores (ACOS reported separately); the official index is coverage-adjusted and ≈0 on
+a sample. Absolute DI differences are noisy (±5–8 pp), so use paired tests over the scored questions.
+Per-track results are in `benchmarks/cache/di/<name>/` (`results.jsonl`, `scores.json`,
+`benchmark-summary.json`) and the consolidated matrix is `DI-TRACKS.md`.
 
-| Run | How it was scored | Result on `bonsai2` |
-| --- | --- | --- |
-| [JevBench](https://github.com/fstandhartinger/jevbench) Public, `easy` + `original` + `hard` | Correct task ids. The [live board](https://benchmarkheaven.com/jev-models) composite is a different number. `bonsai` scored 163/231: it lost 41 tasks against `bonsai2` and gained `hard-opus-b-tradeoff-01` and `hard-opus-c-temporal_numeric-02`. Prompts up to 4k tokens took up to 4.8 s on `bonsai2` and 4.4 s on `bonsai`. | 202 / 231 |
-| [Persian](https://github.com/ArmanJR/Jev-Persian-Benchmark) v1.0.0, commit [`ac218d9`](https://github.com/ArmanJR/Jev-Persian-Benchmark/commit/ac218d96630da9d9cc08fd897868c4d3c7048b0d) | Direct POST. Choice and yes/no as above. Score is within ±0.5 of the expected value. Six questions share one prompt prefix. | Choice 237/240, yes/no 154/160, score 68/80 |
-| [BTZSC pilot](https://github.com/AbdelStark/jev-benchmarks) on [btzsc/btzsc](https://huggingface.co/datasets/btzsc/btzsc) revision `fef2a2ac`, seed `20260917`, 100 examples each | Direct POST. Question: which single label best describes the input text. | AG News 90/100, emotion 45/100, Banking77 76/100 (72 labels in that sample) |
+## Documents
 
-[Decision Index](https://github.com/apolinario/decision-index) 0.2.1 and the [tasksource](https://huggingface.co/datasets/tasksource/tasksource-jev-typed-decisions) training recast were not run.
+Benchmark docs (this directory):
+
+| file | what it is |
+|---|---|
+| `RECOMMENDATIONS.md` | which LoRA to use per model, and the selection rule (DI arbiter, 231 guardrail) |
+| `RESULTS.md` | consolidated 231 / DI / latency / Clef-comparison tables |
+| `EXAM.md` | error taxonomy and style/ensemble analysis for the 231 exam |
+| `FLIGHT.md` | flight-simulation control test (does the model drive the drone) |
+| `DIRECT-INFER.md` | direct-generation control test (coherent text vs garbled) |
+| `DI-TRACKS.md` | per-track DI matrix for the sample-1500 runs |
+
+Methodology docs (`../docs/`):
+
+| file | what it is |
+|---|---|
+| [`../docs/LORAS.md`](../docs/LORAS.md) | adapter inventory, where the mass is, merge theory, provenance |
+| [`../docs/RECIPES.md`](../docs/RECIPES.md) | how each final LoRA was produced and how to reproduce it |
+| [`../docs/BLOCK-SEARCH.md`](../docs/BLOCK-SEARCH.md) | the block/layer study (modules × layers) and glossary |
+| [`../docs/TRAINING-FREE-HOOKS.md`](../docs/TRAINING-FREE-HOOKS.md) | what can be borrowed from the `strands-decider` model without training |

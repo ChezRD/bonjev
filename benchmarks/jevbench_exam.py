@@ -9,6 +9,7 @@ If that port is closed, starts target/release/bonjev and stops it afterwards.
 import argparse
 import hashlib
 import json
+import os
 import subprocess
 import time
 import urllib.error
@@ -105,14 +106,24 @@ def server_up(origin):
         return False
 
 
-def start_server(port):
+def start_server(port, model, ctx=16384):
     binary = REPO / "target" / "release" / "bonjev"
     if not binary.is_file():
         raise SystemExit(f"missing {binary}; run cargo build --release")
     log_path = CACHE / "serve.log"
     log = log_path.open("w")
     proc = subprocess.Popen(
-        [str(binary), "serve", "--model", "bonsai2", "--port", str(port)],
+        [
+            str(binary),
+            "serve",
+            "--model",
+            model,
+            "--port",
+            str(port),
+            "--ctx",
+            str(ctx),
+            "--no-vision",
+        ],
         cwd=REPO,
         stdout=log,
         stderr=subprocess.STDOUT,
@@ -128,10 +139,12 @@ def start_server(port):
     raise SystemExit(f"server did not listen; see {log_path}")
 
 
-def score(url, rows, out_path):
+def score(url, rows, out_path, dump_path=None):
     ok = 0
     times = []
     out_path.write_text("")
+    if dump_path is not None:
+        dump_path.write_text("")
     started_all = time.perf_counter()
     for index, row in enumerate(rows, start=1):
         question = row["question"]
@@ -142,7 +155,7 @@ def score(url, rows, out_path):
         )
         started = time.perf_counter()
         try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
+            with urllib.request.urlopen(req, timeout=float(os.environ.get("BONJEV_EXAM_TIMEOUT", "120"))) as resp:
                 body = json.loads(resp.read().decode())
         except urllib.error.HTTPError as err:
             detail = err.read().decode(errors="replace")
@@ -171,6 +184,29 @@ def score(url, rows, out_path):
             )
         if index % 25 == 0 or index == len(rows):
             print(f"{index}/{len(rows)} correct {ok}", flush=True)
+        if dump_path is not None:
+            answer = body.get("answers", {}).get("decision", {}) if isinstance(body, dict) else {}
+            with dump_path.open("a") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "id": row["id"],
+                            "split": row["_split"],
+                            "kind": kind,
+                            "expected": expected,
+                            "got": got,
+                            "ok": hit,
+                            "probability": answer.get("probability"),
+                            "noul": answer.get("noul"),
+                            "probabilities": answer.get("probabilities") or {},
+                            "confidence": answer.get("confidence"),
+                            "margin": answer.get("margin"),
+                            "entropy": answer.get("entropy"),
+                            "answer_first": answer.get("answer_first"),
+                        }
+                    )
+                    + "\n"
+                )
     wall = time.perf_counter() - started_all
     times.sort()
     mid = times[len(times) // 2]
@@ -199,6 +235,23 @@ def main():
         action="store_true",
         help="download the splits again",
     )
+    parser.add_argument(
+        "--model",
+        default="ternary-bonsai-2-27b",
+        help="GGUF id for bonjev serve when the port is down (bonsai-4b, bonsai-1.7b, …)",
+    )
+    parser.add_argument(
+        "--ctx",
+        type=int,
+        default=16384,
+        help="context for bonjev serve when the port is down",
+    )
+    parser.add_argument(
+        "--dump-probs",
+        type=Path,
+        default=None,
+        help="write per-task probabilities/margin/entropy dump",
+    )
     args = parser.parse_args()
     paths = download_splits(args.refresh)
     rows = tasks(paths)
@@ -206,14 +259,18 @@ def main():
         raise SystemExit(f"expected 231 tasks, got {len(rows)}")
     origin, port = origin_of(args.url)
     proc = None
-    if not server_up(origin):
-        print(f"starting bonjev on port {port}", flush=True)
-        proc = start_server(port)
+    started_here = False
+    if server_up(origin):
+        print(f"using server already on {origin}", flush=True)
+    else:
+        print(f"starting bonjev --model {args.model} ctx {args.ctx} on port {port}", flush=True)
+        proc = start_server(port, args.model, args.ctx)
+        started_here = True
     try:
         args.out.parent.mkdir(parents=True, exist_ok=True)
-        score(args.url, rows, args.out)
+        score(args.url, rows, args.out, args.dump_probs)
     finally:
-        if proc is not None and proc.poll() is None:
+        if started_here and proc is not None and proc.poll() is None:
             proc.terminate()
 
 
