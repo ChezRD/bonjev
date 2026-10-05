@@ -27,7 +27,7 @@ extractor metrics; for PEFT adapters it is computed against the base Qwen3.5-9B 
 safetensors.
 
 | adapter | base (revision) | who / what | rank / alpha | modules | layers | `‖dW‖` | `rel` med/max |
-|---|---|---|---|---|---|---|---:|---|
+|---|---|---|---|---|---|---:|---:|
 | **clef-27B** (our delta) | Qwen3.8-27B | Cloudflare Clef − base | 256 (alpha=rank) | all: GDN qkv/gate/a/b/out, attn q/k/v/o, FFN | **40–63** | 98.9 | 0.077 / 0.221 |
 | **clef-flash-9B** (our delta) | Qwen3.5-9B | Cloudflare Clef-Flash − base | 256 | all | **0–31** | 82.7 | 0.077 / 0.244 |
 | **openjev-9B** | Qwen3.5-9B `c2022362…` | ZefanCai Open-Jev | 8 / α16 (×2) | GDN qkv, out; attn q/k/v/o — **no FFN, no gate/a/b** | 0–31 | 21.1 | 0.031 / 0.046 |
