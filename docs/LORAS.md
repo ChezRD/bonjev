@@ -13,7 +13,7 @@ The block/layer search (choosing modules and layers, not percentages) is in
 - [Where the mass is](#where-the-mass-is)
 - [Merging](#merging)
 - [Measured results](#measured-results)
-- [Adapter map and provenance](#adapter-map-and-provenance)
+- [Provenance](#provenance)
 - [Findings](#findings)
 - [Research references](#research-references)
 - [How the sources were trained](#how-the-sources-were-trained)
@@ -26,14 +26,33 @@ the base tensor norm (median / max over tensors). For our extracted deltas `rel`
 extractor metrics; for PEFT adapters it is computed against the base Qwen3.5-9B / Qwen3.8-27B
 safetensors.
 
-| adapter | base (revision) | who / what | rank / alpha | modules | layers | `‖dW‖` | `rel` med/max |
+| adapter | base | who / what | rank / alpha | modules | layers | `‖dW‖` | `rel` med/max |
 |---|---|---|---|---|---|---:|---:|
-| **clef-27B** (our delta) | Qwen3.8-27B | Cloudflare Clef − base | 256 (alpha=rank) | all: GDN qkv/gate/a/b/out, attn q/k/v/o, FFN | **40–63** | 98.9 | 0.077 / 0.221 |
-| **clef-flash-9B** (our delta) | Qwen3.5-9B | Cloudflare Clef-Flash − base | 256 | all | **0–31** | 82.7 | 0.077 / 0.244 |
-| **openjev-9B** | Qwen3.5-9B `c2022362…` | ZefanCai Open-Jev | 8 / α16 (×2) | GDN qkv, out; attn q/k/v/o — **no FFN, no gate/a/b** | 0–31 | 21.1 | 0.031 / 0.046 |
-| **openjev-27B-v1.1** | Qwen3.8-27B `1d4bf0f2…` | ZefanCai Open-Jev | 8 / α16 (×2) | same | 0–63 | 55.8 | 0.044 / 0.074 |
-| **autotrust-JEV-27B** | Qwen3.8-27B | autotrust, KL≈0.017 to Jev 1.13 | 16 / α32 (×2) | GDN qkv/gate/out, attn q/k/v/o, **FFN** | 0–63 | 24.7 | 0.012 / 0.027 |
-| **kahn1-4B** | Qwen3.5-4B | Okura66 Kahn1 | 16 / α32 (×2) | GDN qkv/z/a/b/out; attn q/k/v/o | 0–31 | 1.24 | — (no base) |
+| **clef-27B** (our delta) | Qwen3.8-27B | Cloudflare Clef − base | 256 → 64 | all 12: GDN + attn + FFN | **40–63** | 98.9 | 0.077 / 0.221 |
+| **Vega-27B** | Qwen3.8-27B | vllm-sr/Decision-2.0-Vega-27B | 512 / α1024 → 128 | all 12: GDN + attn + FFN | 0–63 | — | — |
+| **plumb-27B** | Qwen3.5-27B | totum-labs/Qwen3.5-27B-plumb (suffix) | 32 / α64 | all 12 | 0–63 | — | — |
+| **autotrust-27B** | Qwen3.8-27B | autotrust, KL≈0.017 to Jev 1.13 | 16 / α32 (×2) | GDN qkv/gate/out + attn + FFN | 0–63 (mass 20–28 + 62) | 24.7 | 0.012 / 0.027 |
+| **openjev-27B-v1.1** | Qwen3.8-27B `1d4bf0f2…` | ZefanCai Open-Jev | 8 / α16 (×2) | GDN qkv/out + attn q/k/v/o, **no FFN** | 0–63 | 55.8 | 0.044 / 0.074 |
+| **simplejev-27B** | Qwen3.8-27B | SimpleJev/JevAny-Qwen3.8-27B-LoRA | 8 / α16 | all 12 | 0–63 | — | — |
+| **sargedev-r2-27B** | Huihui-3.8-27B (abliterated) | SargeDev/Jev_Qwen3.8-27B-r2-LoRA | 64 / α128 | FFN + attn, **no GDN** | 0–63 | — | — |
+| **canopy-27B** | Qwen3.8-27B | Camellia86/Canopy-Jev-27B | 16 | GDN + attn + FFN | **0–3** | — | — |
+| **autojev-27B** (delta) | Qwen3.8-27B | denis-pplx/autojev-27b | 128 | 496 tensors | 0–63 | 3.0 | — |
+| **novel-2-27B** (delta) | Qwen3.8-27B | aikexue170/jev-novel-2-27b-bf16 | 128 | 496 tensors | 0–63 | 21.3 | — |
+| **clef-flash-9B** (our delta) | Qwen3.5-9B | Cloudflare Clef-Flash − base | 256 → 64 | all 12 | **0–31** | 82.7 | 0.077 / 0.244 |
+| **openjev-9B** | Qwen3.5-9B `c2022362…` | ZefanCai Open-Jev | 8 / α16 (×2) | GDN qkv/out + attn q/k/v/o, **no FFN** | 0–31 | 21.1 | 0.031 / 0.046 |
+| **JevK5-9B** (delta) | Qwen3.5-9B | alibiserikbay/JevK5-9B | 128 | attn + GDN, **no FFN** | 0–31 | 3.9 | — |
+| **kev-8b** | Qwen3-8B-Base | jaredpalmer/kev-8b | 16 / α32 | attn q/k/v/o + FFN | 0–35 | — | — |
+| **Jev-LCT-8B** (delta) | Qwen3-8B | CaoHaoWei/Jev-LCT-Qwen3-8B | 128 | attn + FFN | **34–35** | 763 | — |
+| **kahn1-4B** | Qwen3.5-4B | Okura66 Kahn1 | 16 / α32 (×2) | attn + GDN, **no FFN** | 0–31 | 1.24 | — |
+| **kev-4b** | Qwen3-4B-Base | jaredpalmer/kev-4b (branch `qwen3`) | 16 / α32 | attn + FFN | 0–35 | — | — |
+| **candigate-4B** | Qwen3-4B | CullenYap/CandiGate-Qwen3-4B | 16 / α32 | attn only | 0–35 | — | — |
+| **senna-4B** | Qwen3-4B-Instruct-2507 | sennaLLMLearner/qwen3-4b-system-one-lora | 16 / α32 | attn + FFN | 0–35 | — | — |
+| **JevK5-4B** (delta) | Qwen3.5-4B | alibiserikbay/JevK5 | 128 | attn + GDN, **no FFN** | 0–31 | — | — |
+| **Tiny-Jev-1.7B** | Qwen3-1.7B | lostargon/Tiny-Jev (full fine-tune) | — | all | 0–27 | — | — |
+| **xuhao-1.7B** | Qwen3-1.7B | xuhaodev/Qwen3-1.7B-Jev | 16 / α32 | attn + FFN | 0–27 | — | — |
+
+`‖dW‖` / `rel` are filled for the profiled subset (see [Where the mass is](#where-the-mass-is)); the
+other adapters were inventoried but not profiled per tensor.
 
 Training notes: Clef and Clef-Flash are Cloudflare post-trains (decision models; the backbone does a
 prefill-only pass, the vision part is untouched). Open-Jev is SFT + soft-CE on 80,816 rows (20,204
@@ -156,26 +175,7 @@ Rank 64, `q8_0`, built locally (merge scripts + GGUF writer); they are not in th
 | `think+kv_f16` flags on 9B PTQ1_0 | clef 69 / openjev 80 / merged 82 (default 75/69/69) — the ranking flips |
 | Q2_K: merged9b 77, clef repeat 83 | the +10 anomaly reproduces; merged is below both singles |
 
-## Adapter map and provenance
-
-### Layers and modules
-
-| adapter | base (arch) | layers | modules | rank / α |
-|---|---|---|---|---|
-| clef-27B (our delta) | Qwen3.8-27B (qwen35, 64) | **40–63** | all 12: FFN + GDN + attn | 256 → 64 |
-| clef-flash-9B (our delta) | Qwen3.5-9B (qwen35, 32) | 0–31 | all 12 | 256 → 64 |
-| openjev-27B / 9B | Qwen3.8-27B / 3.5-9B | 0–63 / 0–31 | 6: GDN qkv/out + attn q/k/v/o, **no FFN** | 8 / α16 |
-| autotrust-27B | Qwen3.8-27B | 0–63 (mass 20–28 + 62) | GDN qkv/gate/out + attn + **FFN** | 16 / α32 |
-| Kahn1-4B | Qwen3.5-4B (qwen35, 32) | 0–31 | 9: attn + GDN, **no FFN** | 16 / α32 |
-| kev-8b / kev-4b / senna-4B | Qwen3-8B / 4B / 4B-Instruct (qwen3, 36) | 0–35 | 7: attn q/k/v/o + **FFN** | 16 / α32 |
-| candigate-4B | Qwen3-4B (qwen3, 36) | 0–35 | 4: attn only | 16 / α32 |
-| xuhao-1.7B | Qwen3-1.7B (qwen3, 28) | 0–27 | 7: attn + FFN | 16 / α32 |
-| simplejev-27B | Qwen3.8-27B | 0–63 | all 12 | 8 / α16 |
-| sargedev-r2-27B | Huihui-3.8-27B (abliterated) | 0–63 | FFN everywhere + attn q/k/v/o on full layers, **no GDN** | 64 / α128 |
-| plumb-27B (suffix) | Qwen3.5-27B | 0–63 | all 12 | 32 / α64 |
-| canopy-27B | Qwen3.8-27B | **0–3** | 9: GDN qkv/out + attn + FFN | 16 |
-| JevK5-4B / 9B (delta) | Qwen3.5-4B / 9B | 0–31 | 9: attn + GDN, **no FFN** | 128 (extract) |
-| merged / preserve / slices | derived | union of source layers | | |
+## Provenance
 
 ### Sources and extraction
 
