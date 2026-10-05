@@ -41,6 +41,11 @@ Notes on `spectral_merge3.py`:
 
 Model → parts.
 
+Method terms: **delta** = `W_ft − W_base` re-factored as a low-rank LoRA; **PEFT** = the HF adapter
+format (`lora_A` / `lora_B` + α/r); **suffix adapter** = the plumb/2 `suffix_adapter.safetensors`
+layout (converted with a `×2` factor); **slice** = a partial delta cut by `(layer, module)`. Full
+definitions are in [LORAS.md § Sources and extraction](LORAS.md#sources-and-extraction).
+
 | parts dir | source model | base | method | license |
 |---|---|---|---|---|
 | `kev4b_q3_parts` | `jaredpalmer/kev-4b` (branch `qwen3`) | Qwen3-4B-Base | PEFT | Apache-2.0 |
@@ -67,13 +72,13 @@ Parts → final LoRA. `rank` is the output LoRA rank; `arch` is `qwen3` (1.7B/4B
 | 2 | `4b/B10.gguf` | `align+budget 0.4` | 64 | `kev4b_q3` (layers 0–17, attn+ffn) + `candigate` + `senna` | `build_lora.sh B10` | ✓ |
 | 3 | `4b/alt/m4b_all3_align.gguf` | `align+budget 0.3` | 64 | `kev4b_q3` + `candigate` + `senna` | `build_lora.sh all3_align` | ✓ |
 | 4 | `8b/m8_inv_b04.gguf` | `align+budget 0.4` | 128 | `kev8b_attn` + `kev8b_ffn` + `lct_attn:0.25` | `build_lora.sh m8_inv_b04` | ✓ `‖dW‖` |
-| 5 | `8b/alt/R3.gguf` | `align+budget 0.5` | 128 | `kev8b_attn` + `kev8b_ffn` + `lct_down_late` | `build_lora.sh R3` | ✓ |
+| 5 | `8b/alt/R3.gguf` | `align+budget 0.5` | 128 | `kev8b_attn` + `kev8b_ffn` + `s_lct_down_late` | `build_lora.sh R3` | ✓ |
 | 6 | `27b/vega_clef_plumb.gguf` | `sum` | 128 | `clef27b_r64` + `plumb_parts` + `vega27_parts` | `build_lora.sh vega_clef_plumb` | ✓ |
 | 7 | `27b/alt/m27_clef_plumb_at_half.gguf` | **unpinned** (ad-hoc) | — | `clef27b_r64` + `plumb_parts` + `_at_parts_half` (align+budget 0.3 approx.) | — | ✗ |
 | 8 | `27b/alt/vega_clef_plumb_at_half.gguf` | `sum` | 128 | `clef27b_r64` + `plumb_parts` + `_at_parts_half` + `vega27_parts` | `build_lora.sh vega_clef_plumb_at_half` | ✓ |
 | 9 | `27b/alt/clef_plumb_vegaffn.gguf` | `sum` | 128 | `clef27b_r64` + `plumb_parts` + `vega_ffn` | `build_lora.sh clef_plumb_vegaffn` | ✓ |
 
-`lct_down_late` = `Jev-LCT-Qwen3-8B` late `ffn_down` (layers 34–35).
+`s_lct_down_late` = `Jev-LCT-Qwen3-8B` late `ffn_down` (layers 34–35).
 
 Recipe #6 is the published 27B adapter. It also loads on the v1 `ternary-bonsai-27b` (Qwen3.6, same
 `qwen35` architecture): deterministic 231 176 → **187** (+11), `answer_first` 10.4% → 91.3%.
@@ -81,12 +86,15 @@ Recipe #6 is the published 27B adapter. It also loads on the v1 `ternary-bonsai-
 Example (recipe #2, `B10`):
 
 ```bash
-python scripts/spectral_merge3.py work/parts/B10 64 --align --budget 0.4 --rescale \
-    work/pool/parts/kev4b_q3_parts work/pool/parts/candigate_parts work/pool/parts/senna_parts
-python scripts/gguf_lora_writer.py work/parts/B10 work/B10.gguf 64 qwen3 q8_0
+WORK=work/experiments
+# kev4b_q3 is sliced to layers 0–17 (attn_ + ffn_) into $WORK/build/kev4b_early first
+python scripts/spectral_merge3.py $WORK/build/B10.parts 64 --align --budget 0.4 --rescale \
+    $WORK/build/kev4b_early $WORK/pool/parts/candigate_parts $WORK/pool/parts/senna_parts
+python scripts/gguf_lora_writer.py $WORK/build/B10.parts $WORK/build/B10.gguf 64 qwen3 q8_0
 ```
 
-The `kev4b_q3` layers 0–17 are sliced first (the consolidated script does this automatically).
+The `kev4b_q3` layers 0–17 are sliced first into `$WORK/build/kev4b_early` (the consolidated script
+does this automatically).
 
 ## Consolidated build script
 
@@ -99,7 +107,8 @@ WORK=work/experiments scripts/build_lora.sh vega_clef_plumb
 ```
 
 Recipe #7 (`m27_clef_plumb_at_half`) is an alternate; its exact merge parameters are not pinned, so
-`build_lora.sh` does not build it. The 27B default is recipe #6.
+`build_lora.sh` does not build it. The 27B default is recipe #6. The script also builds `e27_early`
+(the 27B early-block analog of `B10`, layers 0–15, 201/231) which is not shipped.
 
 ## Reproduce from scratch
 

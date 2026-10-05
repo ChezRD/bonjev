@@ -9,6 +9,7 @@ the [root README](../README.md).
 | [LORAS.md](LORAS.md) | adapter inventory, where the delta mass is, merge theory and modes, provenance, findings, and the research survey |
 | [RECIPES.md](RECIPES.md) | how each final LoRA was produced and how to reproduce it from source deltas |
 | [BLOCK-SEARCH.md](BLOCK-SEARCH.md) | the block/layer study (modules × layers), the glossary, and the results that led to each recipe |
+| [BUILD-HISTORY.md](BUILD-HISTORY.md) | the full historical grid of fragment-assembly configurations: composition (fragments, blocks, layers, merge) and 231 score per build |
 | [TRAINING-FREE-HOOKS.md](TRAINING-FREE-HOOKS.md) | what can be borrowed from the `strands-decider` model without training (calibration, prompt styles) |
 | [ENVIRONMENT.md](ENVIRONMENT.md) | every `BONJEV_*` variable, its purpose, and its measured effect on 231 relative to the base model |
 | [ATTRIBUTION.md](ATTRIBUTION.md) | every third-party model used to build the adapters, with its license and notices |
