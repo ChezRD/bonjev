@@ -1,6 +1,5 @@
 mod decision;
 mod engine;
-mod features;
 mod ffi;
 mod hf;
 mod picture;
@@ -34,17 +33,27 @@ enum Cmd {
     Ask(AskArgs),
     /// List known models and their Hugging Face cache status
     Models,
+    /// List the decision LoRA adapters for each model
+    Loras(LorasArgs),
+}
+
+#[derive(Args)]
+struct LorasArgs {
+    /// Only show adapters for this model (canonical id or alias)
+    model: Option<String>,
 }
 
 #[derive(Args)]
 struct ModelArgs {
-    /// bonsai2 = Ternary-Bonsai-2-27B PQ2_0 (7.2 GB), bonsai = Bonsai-27B Q1_0 (3.6 GB).
-    /// q2 and q1 still select those files.
+    /// Commercial Bonsai / Ternary-Bonsai GGUF ids (see `bonjev models`).
+    /// Examples: ternary-bonsai-2-27b (default), bonsai-27b, bonsai-8b, bonsai-4b,
+    /// bonsai-1.7b, ternary-bonsai-8b, ternary-bonsai-4b, ternary-bonsai-1.7b,
+    /// ternary-bonsai-27b. Legacy aliases: bonsai2, bonsai, bonsai8, q1, q2, 8b, …
     #[arg(long, default_value = "bonsai2")]
     model: String,
     #[arg(long, default_value_t = 32768)]
     ctx: u32,
-    #[arg(long, default_value_t = 6)]
+    #[arg(long, default_value_t = 4)]
     threads: u32,
     #[arg(long, default_value_t = 99)]
     ngl: i32,
@@ -57,6 +66,11 @@ struct ModelArgs {
     /// Do not load a vision projector.
     #[arg(long, default_value_t = false)]
     no_vision: bool,
+    /// LoRA adapter(s): a short name (see `bonjev loras`) or a local `.gguf` path.
+    /// Repeatable; append `,scale` to amplify (task arithmetic). Up to 8
+    /// adapters; overrides `BONJEV_LORA`.
+    #[arg(long)]
+    lora: Vec<String>,
 }
 
 #[derive(Args)]
@@ -65,10 +79,6 @@ struct ServeArgs {
     common: ModelArgs,
     #[arg(long, default_value_t = 8080)]
     port: u16,
-    /// How many HTTP requests to take from the queue at once.
-    /// One request still scores up to 6 questions together.
-    #[arg(long, default_value_t = 1)]
-    parallel: u32,
 }
 
 #[derive(Args)]
@@ -91,16 +101,16 @@ struct AskArgs {
 
 fn ask_model(default_model: &'static hf::ModelId) -> Result<&'static hf::ModelId> {
     eprintln!();
-    eprintln!("Модели в кэше нет. Какую поставить?");
+    eprintln!("No model in the cache. Which one should I download?");
     for model in hf::models() {
         eprintln!("  {}  {}", model.name, model.about);
     }
     if !io::stdin().is_terminal() {
-        eprintln!("stdin не терминал, ставлю {}", default_model.name);
+        eprintln!("stdin is not a terminal; using {}", default_model.name);
         return Ok(default_model);
     }
     loop {
-        eprint!("Модель [{}]: ", default_model.name);
+        eprint!("Model [{}]: ", default_model.name);
         io::stderr().flush()?;
         let mut line = String::new();
         if io::stdin().read_line(&mut line)? == 0 {
@@ -139,9 +149,19 @@ fn prepare_model(name: &str, model_path: Option<PathBuf>) -> Result<(PathBuf, &'
     Ok((hf::download(chosen)?, chosen.name))
 }
 
-fn attach_vision(engine: &mut engine::Engine, args: &ModelArgs, model_name: &str) -> Result<()> {
+/// Resolve `--lora` (or `BONJEV_LORA`) into a shim-ready path list.
+fn resolve_lora(model_name: &str, cli: &[String]) -> Result<Option<String>> {
+    let env = std::env::var("BONJEV_LORA").ok();
+    let entries = hf::split_lora_entries(cli, env.as_deref());
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(hf::resolve_lora_spec(model_name, &entries.join(";"))?))
+}
+
+fn resolve_mmproj(args: &ModelArgs, model_name: &str) -> Result<Option<PathBuf>> {
     if args.no_vision {
-        return Ok(());
+        return Ok(None);
     }
     let path = if let Some(path) = &args.mmproj {
         if !path.is_file() {
@@ -150,26 +170,35 @@ fn attach_vision(engine: &mut engine::Engine, args: &ModelArgs, model_name: &str
         path.clone()
     } else {
         let model = hf::canonical(model_name)?;
-        eprintln!("[bonjev] vision projector: {}", model.mmproj);
+        let Some(projector) = model.mmproj else {
+            eprintln!(
+                "[bonjev] '{name}' has no vision projector, vision disabled",
+                name = model.name
+            );
+            return Ok(None);
+        };
+        eprintln!("[bonjev] vision projector: {projector}");
         hf::mmproj(model)?
     };
     eprintln!("[bonjev] vision: {}", path.display());
-    engine.load_vision(&path, args.threads)?;
-    eprintln!(
-        "[bonjev] vision marker: {}",
-        engine.media_marker().unwrap_or("")
-    );
-    Ok(())
+    Ok(Some(path))
 }
 
 fn load_engine(args: &ModelArgs) -> Result<(engine::Engine, String)> {
     let (path, name) = prepare_model(&args.model, args.model_path.clone())?;
     eprintln!("[bonjev] model: {}", path.display());
-    let mut engine = engine::Engine::load(&path, args.ctx, args.threads, args.ngl)?;
-    attach_vision(&mut engine, args, name)?;
-    eprintln!("[bonjev] loaded: vocab={} ctx={}", engine.n_vocab, args.ctx);
-    decision::load_choice_prior(&mut engine, args.ctx as usize)?;
-    Ok((engine, format!("bonjev-{name}")))
+    let lora = resolve_lora(name, &args.lora)?;
+    let spec = engine::LoadSpec {
+        model_path: path,
+        ctx: args.ctx,
+        threads: args.threads,
+        n_gpu_layers: args.ngl,
+        mmproj: resolve_mmproj(args, name)?,
+        lora,
+    };
+    let (engine, ctx) = spec.load_from_ctx(args.ctx)?;
+    eprintln!("[bonjev] loaded: vocab={} ctx={}", engine.n_vocab, ctx);
+    Ok((engine, name.to_string()))
 }
 
 #[tokio::main]
@@ -177,32 +206,19 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Serve(args) => {
-            let parallel = args.parallel.max(1);
-            // The context is split across slots (`n_ctx / slots` tokens each).
-            // Six slots keep a 4106-token prompt inside the default 32768 context
-            // and cover one Persian request, which is six questions.
-            let slots = parallel.clamp(6, 16);
             let (path, name) = prepare_model(&args.common.model, args.common.model_path.clone())?;
             eprintln!("[bonjev] model: {}", path.display());
-            let mut engine = engine::Engine::load_seqs(
-                &path,
-                args.common.ctx,
-                args.common.threads,
-                args.common.ngl,
-                slots,
-            )?;
-            attach_vision(&mut engine, &args.common, name)?;
-            eprintln!(
-                "[bonjev] loaded: vocab={} ctx={} parallel={parallel} slots={slots}",
-                engine.n_vocab, args.common.ctx
-            );
-            decision::load_choice_prior(&mut engine, args.common.ctx as usize / slots as usize)?;
-            let model_name = format!("bonjev-{name}");
-            let state = Arc::new(if parallel == 1 {
-                server::direct(engine, model_name)
-            } else {
-                server::batch(engine, model_name, parallel as usize)
-            });
+            let lora = resolve_lora(name, &args.common.lora)?;
+            let spec = engine::LoadSpec {
+                model_path: path,
+                ctx: args.common.ctx,
+                threads: args.common.threads,
+                n_gpu_layers: args.common.ngl,
+                mmproj: resolve_mmproj(&args.common, name)?,
+                lora,
+            };
+            let model_name = name.to_string();
+            let state = Arc::new(server::direct(spec, model_name)?);
             let app = server::router(state);
             let addr = format!("127.0.0.1:{}", args.port);
             let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -216,7 +232,7 @@ async fn main() -> Result<()> {
             if let Some(path) = &args.image {
                 req.image_bytes = Some(std::fs::read(path)?);
             }
-            let out = decision::run(&mut engine, &model_name, req)?;
+            let out = decision::run(&mut engine, &model_name, &req)?;
             println!("{}", serde_json::to_string_pretty(&out)?);
         }
         Cmd::Models => {
@@ -226,10 +242,34 @@ async fn main() -> Result<()> {
                     None => "not cached".to_string(),
                 };
                 println!(
-                    "{:3}  {}/{}\n     {status}",
-                    model.name, model.repo, model.file
+                    "{}  {}\n     {}/{}\n     {status}",
+                    model.name,
+                    model.about,
+                    model.repo,
+                    model.file
                 );
             }
+        }
+        Cmd::Loras(args) => {
+            let filter = match &args.model {
+                Some(name) => Some(hf::canonical(name)?.name),
+                None => None,
+            };
+            for lora in hf::loras() {
+                if filter.is_some_and(|name| !lora.bases.contains(&name)) {
+                    continue;
+                }
+                println!(
+                    "{}  [{}]\n     {}/{}\n     {}",
+                    lora.name,
+                    lora.bases.join(", "),
+                    hf::lora_repo(lora),
+                    lora.file,
+                    lora.about
+                );
+            }
+            println!();
+            println!("{}", hf::LORA_NOTE);
         }
     }
     Ok(())

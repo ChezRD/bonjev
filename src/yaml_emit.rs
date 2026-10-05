@@ -1,315 +1,105 @@
-//! Stream YAML events through libyaml. A mapping can repeat a key, which a
-//! document tree cannot.
+//! YAML through `yaml_serde`, the maintained `serde_yaml` fork.
+//! `state` is always a literal block. Question and options stay YAML nodes.
 
-use std::ffi::c_void;
-use std::mem::MaybeUninit;
-use std::ptr;
-use std::slice;
+use serde_json::{Map, Value};
 
-use unsafe_libyaml::{
-    yaml_document_end_event_initialize, yaml_document_start_event_initialize, yaml_emitter_delete,
-    yaml_emitter_emit, yaml_emitter_flush, yaml_emitter_initialize, yaml_emitter_set_indent,
-    yaml_emitter_set_output, yaml_emitter_set_unicode, yaml_emitter_set_width, yaml_emitter_t,
-    yaml_encoding_t, yaml_event_t, yaml_mapping_end_event_initialize,
-    yaml_mapping_start_event_initialize, yaml_mapping_style_t, yaml_scalar_event_initialize,
-    yaml_scalar_style_t, yaml_stream_end_event_initialize, yaml_stream_start_event_initialize,
-};
+use crate::prompt::StateValue;
 
-#[cfg(test)]
-use unsafe_libyaml::{
-    yaml_sequence_end_event_initialize, yaml_sequence_start_event_initialize, yaml_sequence_style_t,
-};
+/// State object keys that hold raw image payloads. They ride along outside
+/// the prompt: skipped when rendering, read separately for vision input.
+pub const IMAGE_STATE_KEYS: &[&str] = &[
+    "image",
+    "images",
+    "__media__",
+    "__images__",
+    "frame",
+    "frames",
+];
 
-#[cfg(test)]
-use std::ffi::CStr;
-#[cfg(test)]
-use unsafe_libyaml::{
-    YAML_LITERAL_SCALAR_STYLE, YAML_PLAIN_SCALAR_STYLE, YAML_SCALAR_EVENT, YAML_STREAM_END_EVENT,
-    yaml_event_delete, yaml_parser_delete, yaml_parser_initialize, yaml_parser_parse,
-    yaml_parser_set_input_string, yaml_parser_t,
-};
-
-macro_rules! emit {
-    ($stream:expr, $init:expr) => {{
-        let mut event = MaybeUninit::<yaml_event_t>::uninit();
-        let event = event.as_mut_ptr();
-        let status = $init(event);
-        assert!(status.ok, "yaml event init failed");
-        let status = unsafe { yaml_emitter_emit(&mut $stream.inner.emitter, event) };
-        assert!(status.ok, "yaml emit failed");
-    }};
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScalarStyle {
-    Plain,
-    Literal,
-    Other,
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Scalar {
-    pub text: String,
-    pub style: ScalarStyle,
-}
-
-struct Inner {
-    emitter: yaml_emitter_t,
-    buf: Vec<u8>,
-}
-
-pub struct YamlStream {
-    inner: Box<Inner>,
-}
-
-impl YamlStream {
-    pub fn new() -> Self {
-        let mut inner = Box::new(Inner {
-            emitter: unsafe { MaybeUninit::<yaml_emitter_t>::zeroed().assume_init() },
-            buf: Vec::new(),
-        });
-        unsafe {
-            let ok = yaml_emitter_initialize(&mut inner.emitter);
-            assert!(ok.ok, "yaml emitter init failed");
-            yaml_emitter_set_unicode(&mut inner.emitter, true);
-            yaml_emitter_set_width(&mut inner.emitter, -1);
-            yaml_emitter_set_indent(&mut inner.emitter, 2);
-            let buf_ptr = &mut inner.buf as *mut Vec<u8> as *mut c_void;
-            yaml_emitter_set_output(
-                &mut inner.emitter,
-                write_handler,
-                buf_ptr,
-            );
-        }
-        let mut out = Self { inner };
-        emit!(out, |event| unsafe {
-            yaml_stream_start_event_initialize(event, yaml_encoding_t::YAML_UTF8_ENCODING)
-        });
-        emit!(out, |event| unsafe {
-            yaml_document_start_event_initialize(
-                event,
-                ptr::null_mut(),
-                ptr::null_mut(),
-                ptr::null_mut(),
-                true,
-            )
-        });
-        out
-    }
-
-    pub fn mapping_start(&mut self) {
-        emit!(self, |event| unsafe {
-            yaml_mapping_start_event_initialize(
-                event,
-                ptr::null(),
-                ptr::null(),
-                true,
-                yaml_mapping_style_t::YAML_BLOCK_MAPPING_STYLE,
-            )
-        });
-    }
-
-    pub fn mapping_end(&mut self) {
-        emit!(self, |event| unsafe {
-            yaml_mapping_end_event_initialize(event)
-        });
-    }
-
-    pub fn key(&mut self, text: &str) {
-        self.plain(text);
-    }
-
-    pub fn plain(&mut self, text: &str) {
-        self.scalar(text, yaml_scalar_style_t::YAML_PLAIN_SCALAR_STYLE);
-    }
-
-    #[cfg(test)]
-    pub fn sequence_start(&mut self) {
-        emit!(self, |event| unsafe {
-            yaml_sequence_start_event_initialize(
-                event,
-                ptr::null(),
-                ptr::null(),
-                true,
-                yaml_sequence_style_t::YAML_BLOCK_SEQUENCE_STYLE,
-            )
-        });
-    }
-
-    #[cfg(test)]
-    pub fn sequence_end(&mut self) {
-        emit!(self, |event| unsafe {
-            yaml_sequence_end_event_initialize(event)
-        });
-    }
-
-    pub fn literal(&mut self, text: &str) {
-        let owned;
-        let value = if text.ends_with('\n') {
-            text
-        } else {
-            owned = format!("{text}\n");
-            owned.as_str()
-        };
-        self.scalar(value, yaml_scalar_style_t::YAML_LITERAL_SCALAR_STYLE);
-    }
-
-    fn scalar(&mut self, text: &str, style: yaml_scalar_style_t) {
-        emit!(self, |event| unsafe {
-            yaml_scalar_event_initialize(
-                event,
-                ptr::null(),
-                ptr::null(),
-                text.as_ptr(),
-                text.len() as i32,
-                true,
-                true,
-                style,
-            )
-        });
-    }
-
-    pub fn entry_literal(&mut self, key: &str, value: &str) {
-        self.key(key);
-        self.literal(value);
-    }
-
-    pub fn finish(mut self) -> String {
-        emit!(self, |event| unsafe {
-            yaml_document_end_event_initialize(event, true)
-        });
-        emit!(self, |event| unsafe {
-            yaml_stream_end_event_initialize(event)
-        });
-        unsafe {
-            let ok = yaml_emitter_flush(&mut self.inner.emitter);
-            assert!(ok.ok, "yaml emitter flush failed");
-        }
-        let bytes = std::mem::take(&mut self.inner.buf);
-        String::from_utf8(bytes).expect("yaml emitter wrote utf-8")
+/// The state as one node. A string stays the raw source. It is not parsed
+/// as YAML, so a ticket that looks like a mapping stays a string.
+pub fn state_node(state: &StateValue) -> Value {
+    match state {
+        StateValue::Text(text) => Value::String(text.clone()),
+        StateValue::Other(value) => value.clone(),
     }
 }
 
-unsafe fn write_handler(data: *mut c_void, buffer: *mut u8, size: u64) -> i32 {
-    unsafe {
-        let buf = &mut *(data as *mut Vec<u8>);
-        buf.extend_from_slice(slice::from_raw_parts(buffer, size as usize));
-    }
-    1
-}
-
-impl Drop for YamlStream {
-    fn drop(&mut self) {
-        unsafe { yaml_emitter_delete(&mut self.inner.emitter) }
+/// The state node without raw image payloads.
+pub fn state_node_public(state: &StateValue) -> Value {
+    match state_node(state) {
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .filter(|(key, _)| !IMAGE_STATE_KEYS.contains(&key.as_str()))
+                .collect(),
+        ),
+        node => node,
     }
 }
 
-/// Scalars in stream order. A repeated key stays repeated: a document tree would collapse it.
-#[cfg(test)]
-pub fn parse_scalars(yaml: &str) -> Result<Vec<Scalar>, String> {
-    // SAFETY: the parser reads `yaml` only until `yaml_parser_delete`. Each event is deleted
-    // before the next parse, and the parser is deleted on every exit.
-    unsafe { parse_scalars_raw(yaml.as_bytes()) }
-}
-
-#[cfg(test)]
-unsafe fn parse_scalars_raw(yaml: &[u8]) -> Result<Vec<Scalar>, String> {
-    unsafe {
-        let mut parser = MaybeUninit::<yaml_parser_t>::uninit();
-        let parser = parser.as_mut_ptr();
-        if yaml_parser_initialize(parser).fail {
-            return Err("yaml parser init failed".to_string());
-        }
-        yaml_parser_set_input_string(parser, yaml.as_ptr(), yaml.len() as u64);
-        let mut out = Vec::new();
-        loop {
-            let mut event = MaybeUninit::<yaml_event_t>::uninit();
-            let event = event.as_mut_ptr();
-            if yaml_parser_parse(parser, event).fail {
-                let message = parser_problem(parser);
-                yaml_parser_delete(parser);
-                return Err(message);
-            }
-            if (*event).type_ == YAML_STREAM_END_EVENT {
-                yaml_event_delete(event);
-                yaml_parser_delete(parser);
-                return Ok(out);
-            }
-            if (*event).type_ == YAML_SCALAR_EVENT {
-                let raw = slice::from_raw_parts(
-                    (*event).data.scalar.value,
-                    (*event).data.scalar.length as usize,
-                );
-                let text = match String::from_utf8(raw.to_vec()) {
-                    Ok(text) => text,
-                    Err(_) => {
-                        yaml_event_delete(event);
-                        yaml_parser_delete(parser);
-                        return Err("yaml scalar is not utf-8".to_string());
-                    }
-                };
-                let style = (*event).data.scalar.style;
-                let style = if style == YAML_LITERAL_SCALAR_STYLE {
-                    ScalarStyle::Literal
-                } else if style == YAML_PLAIN_SCALAR_STYLE {
-                    ScalarStyle::Plain
-                } else {
-                    ScalarStyle::Other
-                };
-                out.push(Scalar { text, style });
-            }
-            yaml_event_delete(event);
-        }
+/// Blank instructions/criterion: null, an empty string, or an empty
+/// mapping/sequence. Numbers and booleans always count as content.
+pub fn is_blank(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::String(text) => text.trim().is_empty(),
+        Value::Array(items) => items.is_empty(),
+        Value::Object(map) => map.is_empty(),
+        _ => false,
     }
 }
 
-#[cfg(test)]
-unsafe fn parser_problem(parser: *mut yaml_parser_t) -> String {
-    unsafe {
-        let problem = (&*parser).problem;
-        if problem.is_null() {
-            return "yaml parse failed".to_string();
-        }
-        CStr::from_ptr(problem.cast())
-            .to_string_lossy()
-            .into_owned()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sequence_emits_valid_yaml() {
-        let mut doc = YamlStream::new();
-        doc.mapping_start();
-        doc.key("items");
-        doc.sequence_start();
-        doc.plain("first");
-        doc.plain("second");
-        doc.sequence_end();
-        doc.mapping_end();
-        let yaml = doc.finish();
-        let scalars = parse_scalars(&yaml).unwrap();
-        assert_eq!(
-            scalars,
-            [
-                Scalar {
-                    text: "items".to_string(),
-                    style: ScalarStyle::Plain
-                },
-                Scalar {
-                    text: "first".to_string(),
-                    style: ScalarStyle::Plain
-                },
-                Scalar {
-                    text: "second".to_string(),
-                    style: ScalarStyle::Plain
-                },
-            ]
+/// The user turn: `state` is always a literal block, then `question` and
+/// `options`. The shared state head stays first so one request reuses it.
+pub fn user_doc(
+    state: &Value,
+    question: &Value,
+    options: &[(String, Value)],
+    labels: &[String],
+) -> anyhow::Result<String> {
+    if labels.len() != options.len() {
+        anyhow::bail!(
+            "answer labels ({}) do not match options ({})",
+            labels.len(),
+            options.len()
         );
     }
+    let mut opts = Map::with_capacity(options.len());
+    for (label, (_, value)) in labels.iter().zip(options.iter()) {
+        opts.insert(label.clone(), value.clone());
+    }
+    let mut tail = Map::with_capacity(2);
+    tail.insert("question".to_string(), question.clone());
+    tail.insert("options".to_string(), Value::Object(opts));
+    let tail_yaml =
+        yaml_serde::to_string(&Value::Object(tail)).expect("a JSON value always renders as YAML");
+    let mut doc = literal_block("state", &literal_text(state));
+    doc.push_str(tail_yaml.trim_end());
+    Ok(doc)
+}
+
+/// Text inside `state: |`. A string is copied. A JSON value is rendered as
+/// YAML text so the block stays a scalar, not a nested mapping.
+fn literal_text(state: &Value) -> String {
+    match state {
+        Value::String(text) => text.clone(),
+        other => yaml_serde::to_string(other)
+            .expect("a JSON value always renders as YAML")
+            .trim_end_matches('\n')
+            .to_string(),
+    }
+}
+
+fn literal_block(key: &str, text: &str) -> String {
+    let mut out = format!("{key}: |\n");
+    if text.is_empty() {
+        return out;
+    }
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    for line in body.split('\n') {
+        out.push_str("  ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }

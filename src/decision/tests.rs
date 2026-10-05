@@ -1,7 +1,10 @@
 use serde_json::{Value, json};
 
-use super::pack::{noul_true_probability, pack_answer, positive_argmax};
-use super::wire::{QuestionKind, Request, check_questions, checked_options};
+use super::pack::{
+    EnsembleMode, average_passes, combine_passes, noul_true_probability, option_probs, pack_answer,
+    positive_argmax,
+};
+use super::wire::{AnswerOut, QuestionKind, Request, check_questions, checked_options};
 use crate::prompt::{Axis, Row};
 
 fn keys_of(answer: &impl serde::Serialize) -> Vec<String> {
@@ -37,51 +40,73 @@ fn official_examples_deserialize() {
     let (_, levels) =
         checked_options("frustration", score.questions.get("frustration").unwrap()).unwrap();
     assert_eq!(levels[0].0, "0");
-    assert_eq!(levels[2].1, "Very angry");
+    assert_eq!(levels[2].1, json!("Very angry"));
+
+    // Structured levels and object instructions are TypeOne entries, not 422.
+    let structured = request(
+        r#"{"state":{"ticket":"x"},"questions":{"heat":{"type":"score","instructions":{"question":"Rate it","note":"facts only"},"criteria":[{"summary":"low","signals":["ok"]},{"summary":"high","signals":["bad"]}]}}}"#,
+    );
+    check_questions(&structured).unwrap();
+    let (_, structured_levels) =
+        checked_options("heat", structured.questions.get("heat").unwrap()).unwrap();
+    assert_eq!(structured_levels.len(), 2);
 }
 
 #[test]
 fn answer_shapes_match_the_wire() {
     let noul = Row {
-        state: "x".into(),
+        state: std::sync::Arc::new("x".into()),
         question: "q".into(),
         options: vec![("true".into(), "yes".into()), ("false".into(), "no".into())],
         axis: Axis::Noul,
     };
-    let answer = pack_answer(&noul, &[vec![0], vec![1]], &[2.0, 0.0], None).unwrap();
-    assert_eq!(keys_of(&answer), ["noul", "type"]);
-    assert!(answer.noul.unwrap() > 0.5);
+    let answer = pack_answer(&noul, &[vec![0], vec![1]], &[2.0, 0.0]).unwrap();
+    assert_eq!(keys_of(&answer), ["entropy", "margin", "noul", "type"]);
+    match answer {
+        AnswerOut::Noul { noul, .. } => assert!(noul > 0.5),
+        other => panic!("expected noul, got {other:?}"),
+    }
 
     let choice = Row {
-        state: "x".into(),
+        state: std::sync::Arc::new("x".into()),
         question: "q".into(),
         options: vec![("a".into(), "A".into()), ("b".into(), "B".into())],
         axis: Axis::Choice,
     };
-    let answer = pack_answer(&choice, &[vec![0], vec![1]], &[2.0, 0.0], None).unwrap();
+    let answer = pack_answer(&choice, &[vec![0], vec![1]], &[2.0, 0.0]).unwrap();
     assert_eq!(
         keys_of(&answer),
-        ["choice", "confidence", "probabilities", "type"]
+        ["choice", "confidence", "entropy", "margin", "probabilities", "type"]
     );
-    assert_eq!(answer.choice.as_deref(), Some("a"));
+    match answer {
+        AnswerOut::Choice { choice, .. } => assert_eq!(choice, "a"),
+        other => panic!("expected choice, got {other:?}"),
+    }
 
     let score = Row {
-        state: "x".into(),
+        state: std::sync::Arc::new("x".into()),
         question: "q".into(),
         options: vec![("0".into(), "low".into()), ("1".into(), "high".into())],
         axis: Axis::Score,
     };
-    let answer = pack_answer(&score, &[vec![0], vec![1]], &[0.0, 0.0], None).unwrap();
+    let answer = pack_answer(&score, &[vec![0], vec![1]], &[0.0, 0.0]).unwrap();
     assert_eq!(
         keys_of(&answer),
-        ["confidence", "legend", "probabilities", "score", "type"]
+        ["confidence", "entropy", "legend", "margin", "probabilities", "score", "type"]
     );
-    assert!((answer.score.unwrap() - 0.5).abs() < 1e-5);
-    assert_eq!(
-        answer.legend.unwrap().get("1").map(String::as_str),
-        Some("high")
-    );
-    assert_eq!(answer.confidence.unwrap(), 0.0);
+    match answer {
+        AnswerOut::Score {
+            score,
+            legend,
+            confidence,
+            ..
+        } => {
+            assert!((score - 0.5).abs() < 1e-5);
+            assert_eq!(legend.get("1"), Some(&json!("high")));
+            assert_eq!(confidence, 0.0);
+        }
+        other => panic!("expected score, got {other:?}"),
+    }
 }
 
 #[test]
@@ -95,7 +120,7 @@ fn wire_errors_name_the_field() {
     );
     let err = check_questions(&one_choice).unwrap_err();
     assert_eq!(err.field(), "questions.decision.criteria");
-    assert!(err.to_string().contains("2 to 255"));
+    assert!(err.to_string().contains("at least two options"));
 
     let one_level = request(
         r#"{"questions":{"heat":{"type":"score","instructions":"q","criteria":["only"]}}}"#,
@@ -127,23 +152,22 @@ fn criteria_and_state_keep_json_key_order() {
     let req = request(
         r#"{"state":{"z":"2","a":"1"},"questions":{"decision":{"type":"choice","instructions":"q","criteria":{"z":"last","a":"first"}}}}"#,
     );
-    let scalars = crate::yaml_emit::parse_scalars(&req.state.text()).unwrap();
-    let keys: Vec<_> = scalars
-        .iter()
-        .step_by(2)
-        .map(|scalar| scalar.text.as_str())
+    let state = crate::yaml_emit::state_node_public(&req.state);
+    let back: Value =
+        yaml_serde::from_str(&yaml_serde::to_string(&state).unwrap()).expect("state round-trips");
+    let keys: Vec<_> = back
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
         .collect();
     assert_eq!(keys, ["z", "a"]);
-    let values: Vec<_> = scalars
-        .iter()
-        .skip(1)
-        .step_by(2)
-        .map(|scalar| scalar.text.trim_end())
-        .collect();
-    assert_eq!(values, ["2", "1"]);
+    assert_eq!(back["z"], json!("2"));
+    assert_eq!(back["a"], json!("1"));
     let (_, options) = checked_options("decision", req.questions.get("decision").unwrap()).unwrap();
     assert_eq!(options[0].0, "z");
     assert_eq!(options[1].0, "a");
+    assert_eq!(options[0].1, json!("last"));
 }
 
 #[test]
@@ -176,31 +200,72 @@ fn several_questions_keep_their_ids() {
     let ids: Vec<_> = req.questions.iter().map(|(key, _)| key.as_str()).collect();
     assert_eq!(ids, ["route", "flag", "heat"]);
     check_questions(&req).unwrap();
-    assert!(req.state.text().contains('x'));
-}
-
-#[test]
-fn calibration_flag_defaults_on() {
-    let on =
-        request(r#"{"questions":{"decision":{"instructions":"q","criteria":{"a":"A","b":"B"}}}}"#);
-    assert!(on.scores_are_calibrated);
-    assert_eq!(
-        checked_options("decision", on.questions.get("decision").unwrap())
-            .unwrap()
-            .0,
-        QuestionKind::Choice
-    );
-    let off = request(
-        r#"{"scores_are_calibrated":false,"questions":{"decision":{"instructions":"q","criteria":{"a":"A","b":"B"}}}}"#,
-    );
-    assert!(!off.scores_are_calibrated);
+    let state = crate::yaml_emit::state_node_public(&req.state);
+    let back: Value =
+        yaml_serde::from_str(&yaml_serde::to_string(&state).unwrap()).expect("state round-trips");
+    assert_eq!(back, json!({"text": "x"}));
 }
 
 #[test]
 fn ignored_request_model_does_not_fail_parse() {
-    let value = json!({"model": "jev-latest", "questions": {}});
-    let raw = serde_json::to_string(&value).unwrap();
-    let req = request(&raw);
-    assert!(req.questions.is_empty());
-    let _: Value = serde_json::from_str(&raw).unwrap();
+    let with_model = request(
+        r#"{"model":"jev-latest","state":"ticket","questions":{"decision":{"type":"choice","instructions":"q","criteria":{"a":"A","b":"B"}}}}"#,
+    );
+    let without = request(
+        r#"{"state":"ticket","questions":{"decision":{"type":"choice","instructions":"q","criteria":{"a":"A","b":"B"}}}}"#,
+    );
+    assert_eq!(with_model.state, without.state);
+    let flagged =
+        checked_options("decision", with_model.questions.get("decision").unwrap()).unwrap();
+    let plain = checked_options("decision", without.questions.get("decision").unwrap()).unwrap();
+    assert_eq!(flagged, plain);
+}
+
+#[test]
+fn prompt_style_is_optional() {
+    let named = request(
+        r#"{"state":"ticket","prompt_style":"native_user","questions":{"decision":{"type":"choice","instructions":"q","criteria":{"a":"A","b":"B"}}}}"#,
+    );
+    assert_eq!(named.prompt_style.as_deref(), Some("native_user"));
+    let plain = request(
+        r#"{"state":"ticket","questions":{"decision":{"type":"choice","instructions":"q","criteria":{"a":"A","b":"B"}}}}"#,
+    );
+    assert_eq!(plain.prompt_style, None);
+}
+
+#[test]
+fn vote_picks_the_majority_slot() {
+    let (probs, choice) = combine_passes(
+        &[vec![0.9, 0.1], vec![0.4, 0.6], vec![0.8, 0.2]],
+        EnsembleMode::Vote,
+    )
+    .unwrap();
+    assert_eq!(choice, Some(0));
+    assert!((probs[0] - 0.7).abs() < 1e-6);
+}
+
+#[test]
+fn vote_tie_falls_back_to_the_mean() {
+    let (_probs, choice) =
+        combine_passes(&[vec![0.9, 0.1], vec![0.1, 0.9]], EnsembleMode::Vote).unwrap();
+    assert_eq!(choice, None);
+}
+
+#[test]
+fn weighted_gives_the_confident_pass_more_weight() {
+    let (probs, choice) =
+        combine_passes(&[vec![0.95, 0.05], vec![0.6, 0.4]], EnsembleMode::Weighted).unwrap();
+    assert_eq!(choice, None);
+    assert!(probs[0] > 0.85, "{probs:?}");
+    assert!((probs[0] + probs[1] - 1.0).abs() < 1e-6);
+}
+
+#[test]
+fn ensemble_average_keeps_the_same_slots() {
+    let avg = average_passes(&[vec![1.0, 0.0], vec![0.0, 1.0], vec![1.0, 0.0]]).unwrap();
+    assert!((avg[0] - 2.0 / 3.0).abs() < 1e-6);
+    assert!((avg[1] - 1.0 / 3.0).abs() < 1e-6);
+    let slots = option_probs(&[vec![1], vec![2]], &[0.0, 1.0, 1.0], Axis::Choice);
+    assert!((slots[0] - 0.5).abs() < 1e-5);
+    assert!((slots[1] - 0.5).abs() < 1e-5);
 }

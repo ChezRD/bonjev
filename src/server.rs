@@ -1,5 +1,5 @@
 use crate::decision::{self, Request, Response, RunError};
-use crate::engine::Engine;
+use crate::engine::{Engine, EngineFault, EngineFaultKind, LoadSpec, MIN_VRAM_CTX};
 use axum::extract::rejection::JsonRejection;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response as HttpResponse};
@@ -9,43 +9,89 @@ use axum::{
     routing::{get, post},
 };
 use serde::Serialize;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+
+struct Runtime {
+    spec: LoadSpec,
+    engine: Option<Engine>,
+    active_ctx: u32,
+}
+
+impl Runtime {
+    fn ensure_loaded(&mut self) -> Result<(), RunError> {
+        if self.engine.is_some() {
+            return Ok(());
+        }
+        let (engine, ctx) = self
+            .spec
+            .load_from_ctx(self.active_ctx)
+            .map_err(RunError::Engine)?;
+        self.active_ctx = ctx;
+        eprintln!(
+            "[bonjev] loaded: vocab={} ctx={}",
+            engine.n_vocab, self.active_ctx
+        );
+        self.engine = Some(engine);
+        Ok(())
+    }
+
+    fn unload(&mut self) {
+        if self.engine.is_some() {
+            eprintln!("[bonjev] unloading active model from VRAM");
+        }
+        self.engine = None;
+        crate::readout::reset_prior();
+    }
+
+    fn engine_mut(&mut self) -> Result<&mut Engine, RunError> {
+        self.ensure_loaded()?;
+        Ok(self.engine.as_mut().expect("engine loaded"))
+    }
+
+    fn recoverable(err: &RunError) -> bool {
+        match err {
+            RunError::Engine(inner) => inner
+                .downcast_ref::<EngineFault>()
+                .is_some_and(|fault| fault.kind.recoverable()),
+            _ => false,
+        }
+    }
+
+    fn run(&mut self, model_name: &str, req: &Request) -> Result<Response, RunError> {
+        self.ensure_loaded()?;
+        match decision::run(self.engine_mut()?, model_name, req) {
+            ok @ Ok(_) => ok,
+            Err(err) if Self::recoverable(&err) && self.active_ctx > MIN_VRAM_CTX => {
+                eprintln!(
+                    "[bonjev] inference error, unloading and retrying with smaller ctx: {err}"
+                );
+                self.unload();
+                self.active_ctx = (self.active_ctx / 2).max(MIN_VRAM_CTX);
+                self.ensure_loaded()?;
+                decision::run(self.engine_mut()?, model_name, req)
+            }
+            Err(err) => Err(err),
+        }
+    }
+}
 
 pub struct AppState {
-    pub model_name: String,
-    slot: Slot,
+    model_name: String,
+    runtime: Mutex<Runtime>,
 }
 
-enum Slot {
-    Direct(Mutex<Engine>),
-    Batch(Mutex<Sender<Job>>),
-}
-
-struct Job {
-    req: Request,
-    reply: Sender<Result<Response, RunError>>,
-}
-
-pub fn direct(engine: Engine, model_name: String) -> AppState {
-    AppState {
+pub fn direct(spec: LoadSpec, model_name: String) -> Result<AppState, RunError> {
+    let start_ctx = spec.ctx;
+    let mut runtime = Runtime {
+        spec,
+        engine: None,
+        active_ctx: start_ctx,
+    };
+    runtime.ensure_loaded()?;
+    Ok(AppState {
         model_name,
-        slot: Slot::Direct(Mutex::new(engine)),
-    }
-}
-
-pub fn batch(engine: Engine, model_name: String, parallel: usize) -> AppState {
-    let (tx, rx) = std::sync::mpsc::channel();
-    let name = model_name.clone();
-    std::thread::Builder::new()
-        .name("bonjev-batch".to_string())
-        .spawn(move || batch_loop(engine, name, rx, parallel))
-        .expect("batch thread");
-    AppState {
-        model_name,
-        slot: Slot::Batch(Mutex::new(tx)),
-    }
+        runtime: Mutex::new(runtime),
+    })
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -87,47 +133,10 @@ async fn systemone(
             return error_json(StatusCode::UNPROCESSABLE_ENTITY, err.to_string(), None);
         }
     };
-    let result = if matches!(st.slot, Slot::Batch(_)) {
-        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-        {
-            let Slot::Batch(tx) = &st.slot else {
-                unreachable!("matched batch");
-            };
-            if tx
-                .lock()
-                .unwrap_or_else(|err| err.into_inner())
-                .send(Job {
-                    req,
-                    reply: reply_tx,
-                })
-                .is_err()
-            {
-                return error_json(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "batch worker stopped".to_string(),
-                    None,
-                );
-            }
-        }
-        match tokio::task::spawn_blocking(move || reply_rx.recv()).await {
-            Ok(Ok(body)) => body,
-            Ok(Err(_)) => {
-                return error_json(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "batch worker dropped the reply".to_string(),
-                    None,
-                );
-            }
-            Err(err) => {
-                return error_json(StatusCode::INTERNAL_SERVER_ERROR, err.to_string(), None);
-            }
-        }
-    } else {
-        match tokio::task::spawn_blocking(move || decide(&st, req)).await {
-            Ok(body) => body,
-            Err(err) => {
-                return error_json(StatusCode::INTERNAL_SERVER_ERROR, err.to_string(), None);
-            }
+    let result = match tokio::task::spawn_blocking(move || decide(&st, &req)).await {
+        Ok(body) => body,
+        Err(err) => {
+            return error_json(StatusCode::INTERNAL_SERVER_ERROR, err.to_string(), None);
         }
     };
     match result {
@@ -144,7 +153,13 @@ fn decide_error(err: RunError) -> HttpResponse {
             Some(err.field().to_string()),
         ),
         RunError::Engine(err) => {
-            error_json(StatusCode::INTERNAL_SERVER_ERROR, err.to_string(), None)
+            let status = match err.downcast_ref::<EngineFault>() {
+                Some(fault) if fault.kind == EngineFaultKind::TooLong => {
+                    StatusCode::UNPROCESSABLE_ENTITY
+                }
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            error_json(status, err.to_string(), None)
         }
     }
 }
@@ -152,69 +167,39 @@ fn decide_error(err: RunError) -> HttpResponse {
 fn error_json(status: StatusCode, message: String, field: Option<String>) -> HttpResponse {
     #[derive(Serialize)]
     struct Body {
-        error: Detail,
+        detail: Vec<Detail>,
     }
     #[derive(Serialize)]
     struct Detail {
-        message: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        field: Option<String>,
+        loc: Vec<String>,
+        msg: String,
+        #[serde(rename = "type")]
+        kind: &'static str,
     }
+    // Official 422 shape: {"detail": [{"loc": ["body", ...], "msg", "type"}]}.
+    let loc = match field {
+        Some(path) => std::iter::once("body".to_string())
+            .chain(path.split('.').map(str::to_string))
+            .collect(),
+        None => vec!["body".to_string()],
+    };
     (
         status,
         Json(Body {
-            error: Detail { message, field },
+            detail: vec![Detail {
+                loc,
+                msg: message,
+                kind: "value_error",
+            }],
         }),
     )
         .into_response()
 }
 
-fn batch_loop(mut engine: Engine, model_name: String, rx: Receiver<Job>, parallel: usize) {
-    while let Some(jobs) = gather(&rx, parallel) {
-        if jobs.len() > 1 {
-            eprintln!("[bonjev] batch {}", jobs.len());
-        }
-        let mut replies = Vec::with_capacity(jobs.len());
-        let mut reqs = Vec::with_capacity(jobs.len());
-        for job in jobs {
-            replies.push(job.reply);
-            reqs.push(job.req);
-        }
-        let results = decision::run_many(&mut engine, &model_name, reqs);
-        for (reply, result) in replies.into_iter().zip(results) {
-            let _ = reply.send(result);
-        }
-    }
+fn decide(st: &AppState, req: &Request) -> Result<Response, RunError> {
+    runtime_lock(&st.runtime).run(&st.model_name, req)
 }
 
-fn gather(rx: &Receiver<Job>, parallel: usize) -> Option<Vec<Job>> {
-    let first = rx.recv().ok()?;
-    let mut jobs = vec![first];
-    if parallel <= 1 {
-        return Some(jobs);
-    }
-    let deadline = Instant::now() + Duration::from_millis(40);
-    while jobs.len() < parallel {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            break;
-        }
-        match rx.recv_timeout(left) {
-            Ok(job) => jobs.push(job),
-            Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => break,
-        }
-    }
-    Some(jobs)
-}
-
-fn decide(st: &AppState, req: Request) -> Result<Response, RunError> {
-    let Slot::Direct(engine) = &st.slot else {
-        return Err(anyhow::anyhow!("direct decide on a batch server").into());
-    };
-    let mut engine = engine_lock(engine);
-    decision::run(&mut engine, &st.model_name, req)
-}
-
-fn engine_lock(engine: &Mutex<Engine>) -> MutexGuard<'_, Engine> {
-    engine.lock().unwrap_or_else(|err| err.into_inner())
+fn runtime_lock(runtime: &Mutex<Runtime>) -> MutexGuard<'_, Runtime> {
+    runtime.lock().unwrap_or_else(|err| err.into_inner())
 }

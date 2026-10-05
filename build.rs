@@ -52,14 +52,48 @@ fn prism_dir() -> String {
     );
 }
 
+fn revision_root(dir: &str) -> Option<PathBuf> {
+    let mut p = PathBuf::from(dir);
+    for _ in 0..3 {
+        p = p.parent()?.to_path_buf();
+        if p.join("include/llama.h").is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
 fn main() {
     let dir = prism_dir();
     require_linkable(&dir);
 
-    let mtmd =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../vendor/prism-llama.cpp/tools/mtmd");
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // Prefer the vendored fork inside this repo; fall back to a sibling checkout.
+    let mtmd = {
+        let vendored = manifest.join("vendor/prism-llama.cpp/tools/mtmd");
+        if vendored.is_dir() {
+            vendored
+        } else {
+            manifest.join("../vendor/prism-llama.cpp/tools/mtmd")
+        }
+    };
     let mut builder = cc::Build::new();
-    builder.file("c/src/shim.c").include("c/include");
+    builder.file("c/src/shim.c");
+    // The shim's structs must match the ABI of the linked library, so prefer the
+    // headers of the source revision that produced it (found by walking up from
+    // PRISM_LLAMA_DIR). c/include is the fallback for prebuilt bundles, which
+    // ship no headers.
+    if let Some(root) = revision_root(&dir) {
+        builder.include(root.join("include"));
+        if root.join("ggml/include/ggml.h").is_file() {
+            builder.include(root.join("ggml/include"));
+        }
+        if root.join("tools/mtmd/mtmd.h").is_file() {
+            builder.include(root.join("tools/mtmd"));
+        }
+        println!("cargo:rerun-if-changed={}", root.join("include/llama.h").display());
+    }
+    builder.include("c/include");
     if mtmd.is_dir() {
         builder.include(&mtmd);
         println!("cargo:rerun-if-changed={}", mtmd.display());

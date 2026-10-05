@@ -7,7 +7,7 @@ use std::fmt;
 
 pub use crate::prompt::{IMAGE_STATE_KEYS, StateValue};
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct Request {
     #[serde(default)]
     pub state: StateValue,
@@ -18,26 +18,14 @@ pub struct Request {
     /// Raw file bytes from the CLI. Not part of the JSON body.
     #[serde(skip)]
     pub image_bytes: Option<Vec<u8>>,
-    /// Choice scores subtract a fraction of the null-prompt prior.
-    /// Missing field means calibrated. `false` scores the raw choice logits.
-    #[serde(default = "default_calibrated")]
-    pub scores_are_calibrated: bool,
-}
-
-fn default_calibrated() -> bool {
-    true
+    /// Prompt style for this request. One name, `top3`, or up to three names
+    /// separated by commas. `top3` is `w2_word3_desc`, `native_user`, and
+    /// `native_user_theanswer`, scored together. Unset uses `BONJEV_STYLE`, then `answer`.
+    #[serde(default)]
+    pub prompt_style: Option<String>,
 }
 
 impl Request {
-    pub(super) fn has_image(&self) -> bool {
-        self.image_bytes.is_some()
-            || self
-                .image
-                .as_deref()
-                .is_some_and(|text| !text.trim().is_empty())
-            || self.state_image().is_some()
-    }
-
     pub(super) fn state_image(&self) -> Option<&str> {
         let StateValue::Other(Value::Object(map)) = &self.state else {
             return None;
@@ -54,16 +42,18 @@ impl Request {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct Question {
     /// Missing `type` is choice. `boolean` is accepted and answered as `noul`.
     #[serde(rename = "type", default)]
     pub kind: String,
+    /// What the model should decide. A string, an object, an array, or null,
+    /// exactly as the TypeSafe contract allows.
     #[serde(default)]
-    pub instructions: String,
+    pub instructions: Value,
     /// Alias used by the original System One body when `instructions` is empty.
     #[serde(default)]
-    pub criterion: String,
+    pub criterion: Value,
     #[serde(default)]
     pub criteria: Criteria,
 }
@@ -96,7 +86,7 @@ impl QuestionKind {
 
 /// JSON object that keeps the key order from the request.
 /// `serde_json::Map` only implements serde for `Value`, and `BTreeMap` sorts keys.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct ObjMap<T>(Vec<(String, T)>);
 
 impl<T> ObjMap<T> {
@@ -164,7 +154,7 @@ impl<T: Serialize> Serialize for ObjMap<T> {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(untagged)]
 pub enum Criteria {
     Map(Map<String, Value>),
@@ -178,16 +168,14 @@ impl Default for Criteria {
     }
 }
 
-fn criterion_text(value: &Value) -> String {
-    value.as_str().unwrap_or("").to_string()
-}
-
-pub(super) fn question_text(question: &Question) -> String {
-    let instructions = question.instructions.trim();
-    if !instructions.is_empty() {
-        return instructions.to_string();
+pub(super) fn question_value(question: &Question) -> Value {
+    if !crate::yaml_emit::is_blank(&question.instructions) {
+        return question.instructions.clone();
     }
-    question.criterion.trim().to_string()
+    if !crate::yaml_emit::is_blank(&question.criterion) {
+        return question.criterion.clone();
+    }
+    Value::String(String::new())
 }
 
 #[derive(Debug)]
@@ -253,6 +241,7 @@ impl From<anyhow::Error> for RunError {
     }
 }
 
+#[cfg(test)]
 pub(super) fn check_questions(req: &Request) -> Result<(), WireError> {
     if req.questions.is_empty() {
         return Err(WireError::new("questions", "questions is empty"));
@@ -266,7 +255,7 @@ pub(super) fn check_questions(req: &Request) -> Result<(), WireError> {
 pub(super) fn checked_options(
     qid: &str,
     question: &Question,
-) -> Result<(QuestionKind, Vec<(String, String)>), WireError> {
+) -> Result<(QuestionKind, Vec<(String, Value)>), WireError> {
     let Some(kind) = QuestionKind::parse(&question.kind) else {
         return Err(WireError::new(
             format!("questions.{qid}.type"),
@@ -281,26 +270,36 @@ pub(super) fn checked_options(
     Ok((kind, options))
 }
 
-fn choice_options(qid: &str, criteria: &Criteria) -> Result<Vec<(String, String)>, WireError> {
+fn choice_options(qid: &str, criteria: &Criteria) -> Result<Vec<(String, Value)>, WireError> {
     let Criteria::Map(map) = criteria else {
         return Err(WireError::new(
             format!("questions.{qid}.criteria"),
             "choice criteria is a map of options",
         ));
     };
-    if !(2..=255).contains(&map.len()) {
+    if map.len() < 2 {
         return Err(WireError::new(
             format!("questions.{qid}.criteria"),
-            "choice needs 2 to 255 options",
+            format!("a choice needs at least two options (got {})", map.len()),
+        ));
+    }
+    if map.len() > crate::prompt::MAX_LABELS {
+        return Err(WireError::new(
+            format!("questions.{qid}.criteria"),
+            format!(
+                "options per choice is limited to {} (got {})",
+                crate::prompt::MAX_LABELS,
+                map.len()
+            ),
         ));
     }
     Ok(map
         .iter()
-        .map(|(key, value)| (key.clone(), criterion_text(value)))
+        .map(|(key, value)| (key.clone(), value.clone()))
         .collect())
 }
 
-fn score_options(qid: &str, criteria: &Criteria) -> Result<Vec<(String, String)>, WireError> {
+fn score_options(qid: &str, criteria: &Criteria) -> Result<Vec<(String, Value)>, WireError> {
     let Criteria::List(items) = criteria else {
         return Err(WireError::new(
             format!("questions.{qid}.criteria"),
@@ -310,51 +309,46 @@ fn score_options(qid: &str, criteria: &Criteria) -> Result<Vec<(String, String)>
     if !(2..=10).contains(&items.len()) {
         return Err(WireError::new(
             format!("questions.{qid}.criteria"),
-            "score needs 2 to 10 levels",
+            format!("a score takes 2 to 10 levels (got {})", items.len()),
         ));
     }
-    let mut options = Vec::with_capacity(items.len());
-    for (index, value) in items.iter().enumerate() {
-        let Value::String(text) = value else {
-            return Err(WireError::new(
-                format!("questions.{qid}.criteria"),
-                "score levels are strings",
-            ));
-        };
-        options.push((index.to_string(), text.clone()));
-    }
-    Ok(options)
+    Ok(items
+        .iter()
+        .enumerate()
+        .map(|(index, value)| (index.to_string(), value.clone()))
+        .collect())
 }
 
-fn noul_options(qid: &str, criteria: &Criteria) -> Result<Vec<(String, String)>, WireError> {
+fn noul_options(qid: &str, criteria: &Criteria) -> Result<Vec<(String, Value)>, WireError> {
+    let mut true_desc = Value::String("true".to_string());
+    let mut false_desc = Value::String("false".to_string());
     match criteria {
-        Criteria::Other(Value::Null) => Ok(vec![
-            ("true".to_string(), "true".to_string()),
-            ("false".to_string(), "false".to_string()),
-        ]),
+        Criteria::Other(Value::Null) => {}
         Criteria::Map(map) => {
-            if !map.contains_key("true") {
-                return Err(WireError::new(
-                    format!("questions.{qid}.criteria"),
-                    "noul criteria need a true key",
-                ));
+            for (key, value) in map {
+                match key.as_str() {
+                    "true" => true_desc = value.clone(),
+                    "false" => false_desc = value.clone(),
+                    _ => {
+                        return Err(WireError::new(
+                            format!("questions.{qid}.criteria"),
+                            "noul criteria only allows true and false",
+                        ))
+                    }
+                }
             }
-            if map.keys().any(|key| key != "true" && key != "false") {
-                return Err(WireError::new(
-                    format!("questions.{qid}.criteria"),
-                    "noul criteria only allows true and false",
-                ));
-            }
-            Ok(map
-                .iter()
-                .map(|(key, value)| (key.clone(), criterion_text(value)))
-                .collect())
         }
-        _ => Err(WireError::new(
-            format!("questions.{qid}.criteria"),
-            "noul criteria is a true/false map",
-        )),
+        _ => {
+            return Err(WireError::new(
+                format!("questions.{qid}.criteria"),
+                "noul criteria is a true/false map",
+            ))
+        }
     }
+    Ok(vec![
+        ("true".to_string(), true_desc),
+        ("false".to_string(), false_desc),
+    ])
 }
 
 #[derive(Debug, Serialize)]
@@ -364,28 +358,116 @@ pub struct Response {
     pub usage: Usage,
 }
 
-#[derive(Debug, Serialize)]
-pub struct AnswerOut {
-    #[serde(rename = "type")]
-    pub kind: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub choice: Option<String>,
-    #[serde(skip_serializing_if = "Map::is_empty")]
-    pub probabilities: Map<String, Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub noul: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub confidence: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub score: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub legend: Option<ObjMap<String>>,
+#[derive(Debug)]
+pub enum AnswerOut {
+    Choice {
+        choice: String,
+        probabilities: Map<String, Value>,
+        confidence: f32,
+        margin: f32,
+        entropy: f32,
+        answer_first: Option<bool>,
+    },
+    Score {
+        score: f32,
+        legend: ObjMap<Value>,
+        probabilities: Map<String, Value>,
+        confidence: f32,
+        margin: f32,
+        entropy: f32,
+        answer_first: Option<bool>,
+    },
+    Noul {
+        noul: f32,
+        margin: f32,
+        entropy: f32,
+        answer_first: Option<bool>,
+    },
+}
+
+impl AnswerOut {
+    pub fn set_answer_first(&mut self, value: Option<bool>) {
+        match self {
+            Self::Choice { answer_first, .. }
+            | Self::Score { answer_first, .. }
+            | Self::Noul { answer_first, .. } => *answer_first = value,
+        }
+    }
+}
+
+impl Serialize for AnswerOut {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        match self {
+            Self::Choice {
+                choice,
+                probabilities,
+                confidence,
+                margin,
+                entropy,
+                answer_first,
+            } => {
+                map.serialize_entry("type", "choice")?;
+                map.serialize_entry("choice", choice)?;
+                if !probabilities.is_empty() {
+                    map.serialize_entry("probabilities", probabilities)?;
+                }
+                map.serialize_entry("confidence", confidence)?;
+                map.serialize_entry("margin", margin)?;
+                map.serialize_entry("entropy", entropy)?;
+                if let Some(value) = answer_first {
+                    map.serialize_entry("answer_first", value)?;
+                }
+            }
+            Self::Score {
+                score,
+                legend,
+                probabilities,
+                confidence,
+                margin,
+                entropy,
+                answer_first,
+            } => {
+                map.serialize_entry("type", "score")?;
+                if !probabilities.is_empty() {
+                    map.serialize_entry("probabilities", probabilities)?;
+                }
+                map.serialize_entry("confidence", confidence)?;
+                map.serialize_entry("margin", margin)?;
+                map.serialize_entry("entropy", entropy)?;
+                if let Some(value) = answer_first {
+                    map.serialize_entry("answer_first", value)?;
+                }
+                map.serialize_entry("score", score)?;
+                map.serialize_entry("legend", legend)?;
+            }
+            Self::Noul {
+                noul,
+                margin,
+                entropy,
+                answer_first,
+            } => {
+                map.serialize_entry("type", "noul")?;
+                map.serialize_entry("noul", noul)?;
+                map.serialize_entry("margin", margin)?;
+                map.serialize_entry("entropy", entropy)?;
+                if let Some(value) = answer_first {
+                    map.serialize_entry("answer_first", value)?;
+                }
+            }
+        }
+        map.end()
+    }
 }
 
 #[derive(Debug, Serialize)]
 pub struct Usage {
     pub input_tokens: usize,
     pub output_tokens: u32,
+    /// Prompt tokens reused from KV cache, not recomputed in this call.
+    pub cache_hit_tokens: usize,
+    /// Prompt tokens actually prefilled in this call.
+    pub cache_miss_tokens: usize,
 }
 
 pub fn from_options(state: &str, question: &str, kind: &str, options: &[String]) -> Request {
@@ -406,13 +488,13 @@ pub fn from_options(state: &str, question: &str, kind: &str, options: &[String])
             "decision".to_string(),
             Question {
                 kind: kind.to_string(),
-                instructions: question.to_string(),
-                criterion: String::new(),
+                instructions: Value::String(question.to_string()),
+                criterion: Value::Null,
                 criteria,
             },
         ),
         image: None,
         image_bytes: None,
-        scores_are_calibrated: true,
+        prompt_style: None,
     }
 }
